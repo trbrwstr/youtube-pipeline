@@ -130,6 +130,7 @@ async fn set_one(
             client
                 .post(&url)
                 .headers(headers)
+                .timeout(std::time::Duration::from_secs(cfg.request_timeout_secs))
                 .body(bytes.clone())
                 .send()
                 .await
@@ -264,11 +265,14 @@ use rusqlite::OptionalExtension;
 
 /// Set the custom thumbnail for one already-uploaded book. Idempotent — a frame
 /// whose `thumb_set` flag is already on is a no-op. A book missing its
-/// youtube_id or thumb_path errors so it lands in the dead-letter queue.
+/// youtube_id or thumb_path errors so it lands in the dead-letter queue. The
+/// client + throttle are shared across the batch by the runner.
 pub async fn run_one(
     conn: &Connection,
     auth_cfg: &AuthConfig,
     cfg: &ThumbnailConfig,
+    client: &Client,
+    throttle: &Throttle,
     book_id: i64,
 ) -> Result<()> {
     let already_set: Option<i64> = conn
@@ -293,12 +297,7 @@ pub async fn run_one(
     )
     .context("building OAuthConfig for thumbnail stage")?;
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(cfg.request_timeout_secs))
-        .build()?;
-    let throttle = Throttle::from_default();
-
-    set_one(&client, &oauth, &throttle, cfg, &job).await?;
+    set_one(client, &oauth, throttle, cfg, &job).await?;
 
     conn.execute(
         "UPDATE script_frames SET thumb_set = 1 WHERE book_id = ?1",

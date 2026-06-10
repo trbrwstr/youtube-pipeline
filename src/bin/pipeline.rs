@@ -24,10 +24,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::str::FromStr;
 
-use youtube_pipeline::{
-    assemble, config::AppConfig, db, hook, ingest, metadata, selector, state, thumbnail, tts,
-    upload,
-};
+use youtube_pipeline::{config::AppConfig, db, ingest, runner, state};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -200,8 +197,6 @@ fn boot(config_path: &str) -> Result<AppConfig> {
 
 async fn cmd_run(args: RunArgs) -> Result<()> {
     let cfg = boot(&args.config)?;
-    let conn =
-        db::open_and_init(&cfg.db_path).with_context(|| format!("opening db {}", cfg.db_path))?;
 
     // Resolve which stages to run.
     let plan: Vec<Stage> = match (args.stage, args.stages.clone()) {
@@ -231,7 +226,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         let started = std::time::Instant::now();
         println!("\n--- stage: {} ---", stage.label());
 
-        match run_stage(&conn, stage, &cfg, args.limit).await {
+        match run_stage(stage, &cfg, args.limit).await {
             Ok(n) => println!(
                 "--- {} done :: {} item(s) :: {:.1}s ---",
                 stage.label(),
@@ -256,81 +251,29 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Run one stage over its eligible items via the shared state machine. Ingest
-/// is the batch exception (no per-book id exists before it runs); every other
-/// stage claims items, runs `run_one`, and stamps terminal state. Returns the
-/// count of items processed this run (0 = nothing left to do — not an error).
-async fn run_stage(
-    conn: &rusqlite::Connection,
-    stage: Stage,
-    cfg: &AppConfig,
-    limit: usize,
-) -> Result<usize> {
+/// Run one stage. Ingest is the batch exception (no per-book id exists before
+/// it runs); every other stage goes through the shared bounded-concurrency
+/// runner. ingest/hook produce toward the selector's quota when one exists.
+async fn run_stage(stage: Stage, cfg: &AppConfig, limit: usize) -> Result<usize> {
     if stage == Stage::Ingest {
-        return ingest::run_batch(&cfg.db_path, &cfg.ingest, produce_limit(conn, cfg, limit))
+        let lim = runner::produce_limit(cfg, limit);
+        return ingest::run_batch(&cfg.db_path, &cfg.ingest, lim)
             .await
             .context("ingest stage");
     }
 
-    let effective_limit = if stage == Stage::Hook {
-        produce_limit(conn, cfg, limit)
+    let lim = if stage == Stage::Hook {
+        runner::produce_limit(cfg, limit)
     } else {
         limit
     };
-
-    let book_ids = state::eligible_for_stage(
-        conn,
+    runner::run_stage(
+        cfg,
         stage.label(),
         stage.depends_on().map(|d| d.label()),
-        cfg.max_attempts,
-        effective_limit,
+        lim,
     )
-    .with_context(|| format!("selecting eligible items for {}", stage.label()))?;
-
-    let mut processed = 0usize;
-    for book_id in book_ids {
-        state::mark_running(conn, book_id, stage.label())?;
-        match run_one(stage, conn, cfg, book_id).await {
-            Ok(()) => {
-                state::mark_done(conn, book_id, stage.label())?;
-                processed += 1;
-            }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                eprintln!("    book {book_id} :: {} failed: {msg}", stage.label());
-                state::mark_failed(conn, book_id, stage.label(), &msg, cfg.max_attempts)?;
-            }
-        }
-    }
-    Ok(processed)
-}
-
-/// Dispatch one item to its stage module. Mirrors orchestrator.rs so single-
-/// and multi-niche runs share identical per-item behavior.
-async fn run_one(
-    stage: Stage,
-    conn: &rusqlite::Connection,
-    cfg: &AppConfig,
-    book_id: i64,
-) -> Result<()> {
-    match stage {
-        Stage::Ingest => unreachable!("ingest is handled as a batch in run_stage"),
-        Stage::Hook => hook::run_one(conn, &cfg.hook, book_id).await,
-        Stage::Tts => tts::run_one(conn, &cfg.tts, book_id).await,
-        Stage::Assemble => assemble::run_one(conn, &cfg.assemble, book_id).await,
-        Stage::Metadata => metadata::run_one(conn, &cfg.metadata, book_id).await,
-        Stage::Thumbnail => thumbnail::run_one(conn, &cfg.auth, &cfg.thumbnail, book_id).await,
-        Stage::Upload => upload::run_one(conn, &cfg.auth, &cfg.upload, book_id).await,
-    }
-}
-
-/// Selector quota for ingest/hook, capped by the CLI ceiling; else the ceiling.
-fn produce_limit(conn: &rusqlite::Connection, cfg: &AppConfig, ceiling: usize) -> usize {
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    match selector::quota_for(conn, &today, &cfg.channel.niche, &cfg.channel.format) {
-        Ok(Some(q)) if q > 0 => (q as usize).min(ceiling),
-        _ => ceiling,
-    }
+    .await
 }
 
 // ---------------------------------------------------------------------------

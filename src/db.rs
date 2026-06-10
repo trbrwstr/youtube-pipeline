@@ -187,7 +187,13 @@ fn create_pipeline_state(conn: &Connection) -> Result<()> {
 
         -- the 'give me the next N pending jobs for stage X' query lives here.
         CREATE INDEX IF NOT EXISTS idx_state_stage_status
-            ON pipeline_state(stage, status);",
+            ON pipeline_state(stage, status);
+
+        -- partial index over just the workable rows: keeps eligible_for_stage's
+        -- selection cheap no matter how large the done/dead history grows.
+        CREATE INDEX IF NOT EXISTS idx_state_workable
+            ON pipeline_state(stage, book_id)
+            WHERE status IN ('pending','failed');",
     )
     .context("creating pipeline_state table")?;
     Ok(())
