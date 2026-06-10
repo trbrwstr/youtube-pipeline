@@ -1,3 +1,24 @@
+db_path = "./data/forgotten_classics.db"
+
+[channel]
+name   = "Forgotten Classics"
+niche  = "classics"
+format = "long"          # must be "long" or "short" — validate() enforces it
+
+[throttle]
+max_concurrency     = 4
+default_interval_ms = 200
+[throttle.host_intervals_ms]
+"gutenberg.org"           = 250
+"oauth2.googleapis.com"   = 50
+"googleapis.com"          = 500
+
+[auth]
+client_id     = "${YT_CLIENT_ID}"
+client_secret = "${YT_CLIENT_SECRET}"
+refresh_token = "${YT_REFRESH_TOKEN}"
+# token_url defaults to Google's; override only for a mock in tests
+
 [metadata]
 api_base = "https://api.openai.com/v1"
 api_key = "${OPENAI_API_KEY}"
