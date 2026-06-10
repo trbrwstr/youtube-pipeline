@@ -1,0 +1,19 @@
+[metadata]
+api_base = "https://api.openai.com/v1"
+api_key = "${OPENAI_API_KEY}"
+model = "gpt-4o-mini"
+timeout_secs = 30
+max_concurrency = 3
+# YouTube hard limits
+max_title_chars = 100
+max_desc_chars = 5000
+max_tags = 15
+# spend ceiling shared with the hook stage's budget tracker
+max_spend_usd = 5.0
+cost_per_1k_input = 0.00015
+cost_per_1k_output = 0.0006
+channel_blurb = """
+Forgotten Classics — public-domain books, distilled.
+
+New videos weekly. Subscribe for more dead authors, live ideas.
+"""
