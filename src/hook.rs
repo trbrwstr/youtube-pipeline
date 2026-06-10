@@ -67,10 +67,18 @@ pub struct HookConfig {
     pub usd_per_1k_tokens: f64,
 }
 
-fn default_concurrency() -> usize { 6 }
-fn default_min_body_chars() -> usize { 2_000 }
-fn default_max_tokens_budget() -> u64 { 200_000 }
-fn default_usd_per_1k_tokens() -> f64 { 0.0006 }
+fn default_concurrency() -> usize {
+    6
+}
+fn default_min_body_chars() -> usize {
+    2_000
+}
+fn default_max_tokens_budget() -> u64 {
+    200_000
+}
+fn default_usd_per_1k_tokens() -> f64 {
+    0.0006
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct ConfigFile {
@@ -80,10 +88,9 @@ struct ConfigFile {
 impl HookConfig {
     /// Load from a TOML file and resolve any `${ENV_VAR}` values.
     pub fn load(path: &str) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config {}", path))?;
-        let mut cfg: ConfigFile =
-            toml::from_str(&raw).context("parsing config TOML")?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading config {}", path))?;
+        let mut cfg: ConfigFile = toml::from_str(&raw).context("parsing config TOML")?;
         cfg.hook.api_key = resolve_env(&cfg.hook.api_key)?;
         cfg.hook.api_base = resolve_env(&cfg.hook.api_base)?;
         Ok(cfg.hook)
@@ -94,8 +101,7 @@ impl HookConfig {
 fn resolve_env(value: &str) -> Result<String> {
     let trimmed = value.trim();
     if let Some(inner) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-        std::env::var(inner)
-            .with_context(|| format!("env var {} not set", inner))
+        std::env::var(inner).with_context(|| format!("env var {} not set", inner))
     } else {
         Ok(value.to_string())
     }
@@ -118,7 +124,11 @@ pub struct CostGuard {
 
 impl CostGuard {
     pub fn new(budget: u64, usd_per_1k: f64) -> Self {
-        Self { spent: AtomicU64::new(0), budget, usd_per_1k }
+        Self {
+            spent: AtomicU64::new(0),
+            budget,
+            usd_per_1k,
+        }
     }
 
     /// Reserve `estimate` tokens. Returns false if it would breach the budget,
@@ -225,13 +235,21 @@ fn score_excerpt(s: &str) -> f32 {
     score -= (len - 90.0).abs() / 90.0;
 
     // Energy markers.
-    if s.contains('?') { score += 1.2; }
-    if s.contains('!') { score += 0.8; }
-    if s.contains('"') || s.contains('\u{201C}') { score += 0.6; } // dialogue
+    if s.contains('?') {
+        score += 1.2;
+    }
+    if s.contains('!') {
+        score += 0.8;
+    }
+    if s.contains('"') || s.contains('\u{201C}') {
+        score += 0.6;
+    } // dialogue
 
     // First-person / intimacy pulls the viewer in.
     let lower = s.to_lowercase();
-    if lower.starts_with("i ") || lower.contains(" i ") { score += 0.4; }
+    if lower.starts_with("i ") || lower.contains(" i ") {
+        score += 0.4;
+    }
 
     // Penalize chapter-heading junk.
     let alpha: String = s.chars().filter(|c| c.is_alphabetic()).collect();
@@ -264,7 +282,11 @@ pub fn build_hook(book: &Book, wpm: f32) -> ScriptFrame {
     );
     let hook = format!("\"{}\"\n— {}", teaser, book.author);
     let duration = estimate_secs(&voice_line, wpm);
-    ScriptFrame { hook, voice_line, duration_secs: duration }
+    ScriptFrame {
+        hook,
+        voice_line,
+        duration_secs: duration,
+    }
 }
 
 // ============================================================
@@ -318,7 +340,9 @@ pub async fn build_hook_llm(
     if !cost.try_charge(est) {
         eprintln!(
             "[hook] budget reached ({} tok); deterministic for book {} ({})",
-            cost.spent_tokens(), book.id, book.title
+            cost.spent_tokens(),
+            book.id,
+            book.title
         );
         return build_hook(book, cfg.wpm);
     }
@@ -405,7 +429,9 @@ async fn try_llm_hook(
          cliffhanger. No preamble, no surrounding quotes, just the hook. {}",
         book.title,
         book.author,
-        book.year.map(|y| y.to_string()).unwrap_or_else(|| "unknown".into()),
+        book.year
+            .map(|y| y.to_string())
+            .unwrap_or_else(|| "unknown".into()),
         excerpt,
         length_clause,
     );
@@ -413,15 +439,24 @@ async fn try_llm_hook(
     let req = ChatRequest {
         model: &cfg.model,
         messages: vec![
-            ChatMessage { role: "system", content: cfg.system_prompt.clone() },
-            ChatMessage { role: "user", content: user_prompt },
+            ChatMessage {
+                role: "system",
+                content: cfg.system_prompt.clone(),
+            },
+            ChatMessage {
+                role: "user",
+                content: user_prompt,
+            },
         ],
         temperature: if strict { 0.5 } else { 0.8 },
         max_tokens: if strict { 80 } else { 120 },
     };
 
     let resp = client
-        .post(format!("{}/chat/completions", cfg.api_base.trim_end_matches('/')))
+        .post(format!(
+            "{}/chat/completions",
+            cfg.api_base.trim_end_matches('/')
+        ))
         .bearer_auth(&cfg.api_key)
         .json(&req)
         .send()
@@ -447,7 +482,11 @@ async fn try_llm_hook(
     }
 
     let hook = format!("{}\n— {}", voice_line, book.author);
-    Ok(ScriptFrame { hook, voice_line, duration_secs: duration })
+    Ok(ScriptFrame {
+        hook,
+        voice_line,
+        duration_secs: duration,
+    })
 }
 
 // ============================================================
@@ -460,9 +499,12 @@ async fn try_llm_hook(
 /// momentarily-locked write from erroring out instantly.
 pub fn open_db(path: &str) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("opening sqlite {path}"))?;
-    conn.pragma_update(None, "journal_mode", "WAL").context("set WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL").context("set synchronous")?;
-    conn.pragma_update(None, "busy_timeout", 5_000).context("set busy_timeout")?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .context("set WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .context("set synchronous")?;
+    conn.pragma_update(None, "busy_timeout", 5_000)
+        .context("set busy_timeout")?;
     Ok(conn)
 }
 
@@ -470,7 +512,11 @@ pub fn open_db(path: &str) -> Result<Connection> {
 /// clear the bar: a real body (not a stub/index), and a title that isn't an
 /// obvious non-readable artifact (indexes, tables of contents, bibliographies).
 /// Keeps junk out of the LLM spend and off the channel.
-pub fn fetch_unscripted(conn: &Connection, limit: usize, min_body_chars: usize) -> Result<Vec<Book>> {
+pub fn fetch_unscripted(
+    conn: &Connection,
+    limit: usize,
+    min_body_chars: usize,
+) -> Result<Vec<Book>> {
     let mut stmt = conn.prepare(
         "SELECT b.id, b.title, b.author, b.issued_year, b.body
          FROM books b

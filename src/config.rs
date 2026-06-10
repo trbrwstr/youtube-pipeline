@@ -59,7 +59,9 @@ pub struct AppConfig {
     pub selector: SelectorConfig,
 }
 
-fn default_max_attempts() -> i64 { 3 }
+fn default_max_attempts() -> i64 {
+    3
+}
 
 /// `[selector]` — the explore/exploit budget allocator's tuning knobs.
 #[derive(Debug, Clone, Deserialize)]
@@ -100,8 +102,12 @@ impl ThrottleConfig {
     }
 }
 
-fn default_throttle_concurrency() -> usize { 4 }
-fn default_throttle_interval_ms() -> u64 { 200 }
+fn default_throttle_concurrency() -> usize {
+    4
+}
+fn default_throttle_interval_ms() -> u64 {
+    200
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
@@ -132,8 +138,7 @@ fn default_token_url() -> String {
 /// failing one at a time across repeated runs.
 fn resolve_env_vars(raw: &str) -> Result<String> {
     // Matches ${IDENT} where IDENT is the usual env-var charset.
-    let re = Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-        .expect("static env-var regex is valid");
+    let re = Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").expect("static env-var regex is valid");
 
     let mut missing: Vec<String> = Vec::new();
 
@@ -169,14 +174,14 @@ impl AppConfig {
     /// Read TOML from disk, resolve env vars, parse, then validate. Any one of
     /// those failing returns a contextful error pointing at the actual cause.
     pub fn load(path: &str) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config file {path}"))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading config file {path}"))?;
 
-        let resolved = resolve_env_vars(&raw)
-            .with_context(|| format!("resolving env vars in {path}"))?;
+        let resolved =
+            resolve_env_vars(&raw).with_context(|| format!("resolving env vars in {path}"))?;
 
-        let cfg: AppConfig = toml::from_str(&resolved)
-            .with_context(|| format!("parsing config {path}"))?;
+        let cfg: AppConfig =
+            toml::from_str(&resolved).with_context(|| format!("parsing config {path}"))?;
 
         cfg.validate()
             .with_context(|| format!("validating config {path}"))?;
@@ -207,9 +212,7 @@ impl AppConfig {
         // publishes everything PUBLIC or rejects the insert outright.
         match self.upload.privacy_status.as_str() {
             "public" | "unlisted" | "private" => {}
-            other => bail!(
-                "upload.privacy_status must be public|unlisted|private, got '{other}'"
-            ),
+            other => bail!("upload.privacy_status must be public|unlisted|private, got '{other}'"),
         }
 
         // Auth fields are required and env-resolved; if a ${VAR} resolved to

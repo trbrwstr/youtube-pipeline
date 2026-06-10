@@ -15,6 +15,10 @@ ingest → hook → render → upload → analytics → selector → (loop)
 
 ---
 
+> **Running it for real (esp. across multiple channels)?** See
+> [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for per-channel OAuth, the daily
+> produce → analytics → selector loop, and the cross-niche budget allocation.
+
 ## Table of Contents
 
 - [Architecture](#architecture)

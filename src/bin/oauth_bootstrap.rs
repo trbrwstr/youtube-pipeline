@@ -53,8 +53,12 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let redirect = format!("http://{}", args.bind);
 
-    let listener = TcpListener::bind(&args.bind)
-        .with_context(|| format!("binding {} — is it free and registered as a redirect URI?", args.bind))?;
+    let listener = TcpListener::bind(&args.bind).with_context(|| {
+        format!(
+            "binding {} — is it free and registered as a redirect URI?",
+            args.bind
+        )
+    })?;
 
     let consent = format!(
         "{AUTH_URL}?client_id={}&redirect_uri={}&response_type=code\

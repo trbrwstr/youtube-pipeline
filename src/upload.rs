@@ -14,10 +14,10 @@ const HOST: &str = "googleapis.com";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UploadConfig {
-    pub privacy_status: String,   // "private" | "unlisted" | "public"
-    pub category_id: String,      // "27" = Education, "24" = Entertainment
+    pub privacy_status: String, // "private" | "unlisted" | "public"
+    pub category_id: String,    // "27" = Education, "24" = Entertainment
     pub made_for_kids: bool,
-    pub chunk_bytes: usize,       // 8 MiB is a sane resumable chunk
+    pub chunk_bytes: usize, // 8 MiB is a sane resumable chunk
     pub timeout_secs: u64,
 }
 
@@ -162,10 +162,8 @@ async fn push_chunks(
             }
             // 200 / 201 — upload complete, body has the resource with its id.
             200 | 201 => {
-                let parsed: UploadResponse = resp
-                    .json()
-                    .await
-                    .context("parsing final upload response")?;
+                let parsed: UploadResponse =
+                    resp.json().await.context("parsing final upload response")?;
                 return Ok(parsed.id);
             }
             other => {
@@ -190,7 +188,10 @@ pub async fn upload_video(
         .with_context(|| format!("statting {}", job.video_path.display()))?
         .len();
     if file_len == 0 {
-        return Err(anyhow!("refusing to upload empty file {}", job.video_path.display()));
+        return Err(anyhow!(
+            "refusing to upload empty file {}",
+            job.video_path.display()
+        ));
     }
 
     let _guard = throttle.acquire(HOST).await;
@@ -203,7 +204,12 @@ pub async fn upload_video(
 }
 
 /// (output_path, yt_title, yt_description, yt_tags) as stored on a frame.
-type UploadRow = (Option<String>, Option<String>, Option<String>, Option<String>);
+type UploadRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// Stage entry point: publish this book's rendered video, writing the returned
 /// youtube_id back to its frame. Idempotent — a frame that already carries a
@@ -237,11 +243,19 @@ pub async fn run_one(
         .filter(|p| !p.is_empty())
         .ok_or_else(|| anyhow!("book {book_id} has no rendered video to upload"))?;
 
-    let title = yt_title.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| format!("book {book_id}"));
+    let title = yt_title
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("book {book_id}"));
     let description = yt_description.unwrap_or_default();
     let tags: Vec<String> = yt_tags
         .as_deref()
-        .map(|b| b.lines().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .map(|b| {
+            b.lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
 
     let oauth = OAuthConfig::from_values(

@@ -15,9 +15,12 @@ default_interval_ms = 200
 "googleapis.com"          = 500
 
 [auth]
+# client_id / secret are the shared Google Cloud OAuth app; the refresh_token
+# is PER-CHANNEL — mint one with oauth_bootstrap while logged into THIS
+# channel, then export it under this niche's own variable name.
 client_id     = "${YT_CLIENT_ID}"
 client_secret = "${YT_CLIENT_SECRET}"
-refresh_token = "${YT_REFRESH_TOKEN}"
+refresh_token = "${YT_REFRESH_TOKEN_CLASSICS}"
 # token_url defaults to Google's; override only for a mock in tests
 
 [metadata]
@@ -73,6 +76,12 @@ timeout_secs = 60
 [assemble]
 background_image = "assets/classics_bg_1080x1920.png"
 out_dir          = "data/video"
+# Per-niche visual template (all optional — these are the defaults shown).
+font_size        = 58
+font_color       = "white"
+box_color        = "black@0.55"
+caption_bottom_px = 220
+# font_file       = "assets/fonts/EBGaramond-Regular.ttf"   # optional custom font
 
 [thumbnail]
 max_retries          = 3

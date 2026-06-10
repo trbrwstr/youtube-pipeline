@@ -12,13 +12,13 @@ const TTS_HOST: &str = "tts-endpoint";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TtsConfig {
-    pub api_base: String,      // OpenAI-compatible TTS endpoint
+    pub api_base: String, // OpenAI-compatible TTS endpoint
     pub api_key: String,
-    pub model: String,         // e.g. "tts-1" or a local model name
-    pub voice: String,         // "onyx", "echo", etc.
-    pub format: String,        // "mp3"
-    pub speed: f32,            // 0.25..4.0
-    pub cache_dir: String,     // where rendered audio lives
+    pub model: String,     // e.g. "tts-1" or a local model name
+    pub voice: String,     // "onyx", "echo", etc.
+    pub format: String,    // "mp3"
+    pub speed: f32,        // 0.25..4.0
+    pub cache_dir: String, // where rendered audio lives
     pub timeout_secs: u64,
 }
 
@@ -71,7 +71,10 @@ pub async fn synthesize(
     // Cache hit: non-empty file already rendered. Skip the network entirely.
     if let Ok(meta) = tokio::fs::metadata(&out_path).await {
         if meta.len() > 0 {
-            return Ok(TtsOutput { path: out_path, cached: true });
+            return Ok(TtsOutput {
+                path: out_path,
+                cached: true,
+            });
         }
     }
 
@@ -86,7 +89,10 @@ pub async fn synthesize(
     };
 
     let bytes = client
-        .post(format!("{}/audio/speech", cfg.api_base.trim_end_matches('/')))
+        .post(format!(
+            "{}/audio/speech",
+            cfg.api_base.trim_end_matches('/')
+        ))
         .bearer_auth(&cfg.api_key)
         .timeout(Duration::from_secs(cfg.timeout_secs))
         .json(&req)
@@ -113,7 +119,10 @@ pub async fn synthesize(
         .await
         .with_context(|| format!("promoting {} -> {}", tmp.display(), out_path.display()))?;
 
-    Ok(TtsOutput { path: out_path, cached: false })
+    Ok(TtsOutput {
+        path: out_path,
+        cached: false,
+    })
 }
 
 /// Rough fallback duration when ffprobe isn't available: ~2.5 words/sec.

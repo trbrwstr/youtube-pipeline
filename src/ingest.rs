@@ -51,9 +51,15 @@ pub struct IngestConfig {
     pub fetch_text: bool,
 }
 
-fn default_language() -> String { "en".to_string() }
-fn default_max_issued_year() -> i32 { 1928 }
-fn default_cache_dir() -> String { "cache".to_string() }
+fn default_language() -> String {
+    "en".to_string()
+}
+fn default_max_issued_year() -> i32 {
+    1928
+}
+fn default_cache_dir() -> String {
+    "cache".to_string()
+}
 
 /// A catalog row, post-filter and (optionally) post-text-fetch. Mirrors the
 /// `books` table columns the rest of the pipeline reads.
@@ -104,13 +110,12 @@ pub async fn run_batch(db_path: &str, cfg: &IngestConfig, limit: usize) -> Resul
         .context("fetching pg_catalog.csv.gz")?;
 
     // 2. Parse + filter into candidate books.
-    let candidates = parse_and_filter(&csv_bytes, cfg)
-        .context("parsing catalog CSV")?;
+    let candidates = parse_and_filter(&csv_bytes, cfg).context("parsing catalog CSV")?;
     println!("ingest: {} candidate(s) after filter", candidates.len());
 
     // 3. Store rows, skipping ones already in the DB, capped at `limit`.
-    let mut conn = rusqlite::Connection::open(db_path)
-        .with_context(|| format!("opening db {db_path}"))?;
+    let mut conn =
+        rusqlite::Connection::open(db_path).with_context(|| format!("opening db {db_path}"))?;
 
     let mut inserted = 0usize;
     for mut book in candidates {
@@ -174,8 +179,7 @@ async fn fetch_catalog(client: &reqwest::Client, cfg: &IngestConfig) -> Result<V
     let gz_bytes: Vec<u8> = if status == reqwest::StatusCode::NOT_MODIFIED {
         // Cache hit. Read the stored gzip off disk.
         println!("ingest: catalog unchanged (304), using cache");
-        std::fs::read(&gz_path)
-            .with_context(|| format!("reading cached catalog {gz_path}"))?
+        std::fs::read(&gz_path).with_context(|| format!("reading cached catalog {gz_path}"))?
     } else if status.is_success() {
         // Fresh copy. Persist new ETag + gzip for next run's conditional GET.
         if let Some(tag) = resp.headers().get(reqwest::header::ETAG) {
@@ -195,9 +199,7 @@ async fn fetch_catalog(client: &reqwest::Client, cfg: &IngestConfig) -> Result<V
     // Decompress gzip -> raw CSV bytes.
     let mut decoder = GzDecoder::new(&gz_bytes[..]);
     let mut csv = Vec::new();
-    decoder
-        .read_to_end(&mut csv)
-        .context("gunzip catalog")?;
+    decoder.read_to_end(&mut csv).context("gunzip catalog")?;
     Ok(csv)
 }
 
@@ -239,10 +241,7 @@ fn parse_and_filter(csv_bytes: &[u8], cfg: &IngestConfig) -> Result<Vec<Book>> {
         }
 
         // Issued is YYYY-MM-DD (or sometimes blank). Pull the leading year.
-        let issued_year = row
-            .issued
-            .get(0..4)
-            .and_then(|y| y.parse::<i32>().ok());
+        let issued_year = row.issued.get(0..4).and_then(|y| y.parse::<i32>().ok());
 
         // Coarse age gate. If we can't read a year, keep it (don't drop on the
         // basis of a parse failure) — the upstream Type/Language filters are
@@ -338,20 +337,13 @@ pub async fn fetch_book_text(
 /// we slice between them. Falls back to the raw text if markers are absent
 /// (some very old files predate the standard wrapper).
 pub fn strip_pg_boilerplate(raw: &str) -> String {
-    let start_marker = raw
-        .find("*** START OF")
-        .or_else(|| raw.find("***START OF"));
-    let end_marker = raw
-        .find("*** END OF")
-        .or_else(|| raw.find("***END OF"));
+    let start_marker = raw.find("*** START OF").or_else(|| raw.find("***START OF"));
+    let end_marker = raw.find("*** END OF").or_else(|| raw.find("***END OF"));
 
     let body = match (start_marker, end_marker) {
         (Some(s), Some(e)) if e > s => {
             // Advance past the rest of the START marker's own line.
-            let after_start = raw[s..]
-                .find('\n')
-                .map(|nl| s + nl + 1)
-                .unwrap_or(s);
+            let after_start = raw[s..].find('\n').map(|nl| s + nl + 1).unwrap_or(s);
             &raw[after_start..e]
         }
         _ => raw, // no standard wrapper — keep everything

@@ -24,10 +24,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let cfg = AppConfig::load(&args.config)
-        .with_context(|| format!("loading config {}", args.config))?;
-    let conn = db::open_and_init(&cfg.db_path)
-        .with_context(|| format!("opening db {}", cfg.db_path))?;
+    let cfg =
+        AppConfig::load(&args.config).with_context(|| format!("loading config {}", args.config))?;
+    let conn =
+        db::open_and_init(&cfg.db_path).with_context(|| format!("opening db {}", cfg.db_path))?;
     db::set_channel_meta(&conn, &cfg.channel.niche, &cfg.channel.format)?;
 
     let n = analytics::run(&conn, &cfg, args.until_days_ago).await?;

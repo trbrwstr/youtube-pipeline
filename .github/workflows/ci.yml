@@ -25,11 +25,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       # Cache the registry, git deps, and target dir keyed on Cargo.lock.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --check
 
       # rusqlite builds bundled SQLite from source; gcc ships on ubuntu-latest.
       - name: Build (all targets)

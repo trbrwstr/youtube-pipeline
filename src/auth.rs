@@ -100,18 +100,27 @@ pub async fn fetch_access_token(client: &reqwest::Client, cfg: &OAuthConfig) -> 
         ));
     }
 
-    let parsed: RefreshResponse = serde_json::from_str(&text)
-        .with_context(|| format!("parsing refresh response: {text}"))?;
+    let parsed: RefreshResponse =
+        serde_json::from_str(&text).with_context(|| format!("parsing refresh response: {text}"))?;
 
     if parsed.token_type != "Bearer" {
-        return Err(anyhow!("unexpected token_type {:?}, expected Bearer", parsed.token_type));
+        return Err(anyhow!(
+            "unexpected token_type {:?}, expected Bearer",
+            parsed.token_type
+        ));
     }
 
     let expires_at = Instant::now() + Duration::from_secs(parsed.expires_in);
 
     {
         let mut cache = TOKEN_CACHE.lock().await;
-        cache.insert(key, CachedToken { access_token: parsed.access_token.clone(), expires_at });
+        cache.insert(
+            key,
+            CachedToken {
+                access_token: parsed.access_token.clone(),
+                expires_at,
+            },
+        );
     }
 
     Ok(parsed.access_token)
