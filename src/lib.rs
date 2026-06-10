@@ -22,19 +22,19 @@
 // ============================================================
 
 // --- infrastructure: shared by every stage ---
+pub mod auth;
 pub mod config; // unified AppConfig + ${ENV_VAR} resolution
 pub mod db; // SQLite connection, migrations, query helpers
 pub mod state; // resumable state machine (eligible_for_stage, mark_*)
-pub mod throttle; // shared global rate limiter
-pub mod auth; // OAuth: token mint/refresh/cache for YT API stages
+pub mod throttle; // shared global rate limiter // OAuth: token mint/refresh/cache for YT API stages
 
 // --- stages: one module per step in the chain ---
-pub mod ingest; // Gutenberg catalog -> books table
-pub mod hook; // book -> hook_text (deterministic + LLM)
-pub mod tts; // hook/voice line -> hash-cached MP3
 pub mod assemble; // audio + drawtext -> vertical 1080x1920 mp4
+pub mod hook; // book -> hook_text (deterministic + LLM)
+pub mod ingest; // Gutenberg catalog -> books table
 pub mod metadata; // yt_title / yt_description / yt_tags
 pub mod thumbnail; // thumbnail render + thumbnails.set upload
+pub mod tts; // hook/voice line -> hash-cached MP3
 pub mod upload; // resumable video upload, writes youtube_id back
 
 // --- feedback loop: measure performance, reallocate production ---

@@ -42,8 +42,12 @@ pub struct ThumbnailConfig {
     pub request_timeout_secs: u64,
 }
 
-fn default_max_retries() -> u32 { 3 }
-fn default_timeout() -> u64 { 60 }
+fn default_max_retries() -> u32 {
+    3
+}
+fn default_timeout() -> u64 {
+    60
+}
 
 // ============================================================
 //  Job + MIME
@@ -138,8 +142,11 @@ async fn set_one(
                 if attempt < cfg.max_retries {
                     attempt += 1;
                     throttle
-                        .backoff(attempt, std::time::Duration::from_millis(500),
-                                 std::time::Duration::from_secs(30))
+                        .backoff(
+                            attempt,
+                            std::time::Duration::from_millis(500),
+                            std::time::Duration::from_secs(30),
+                        )
                         .await;
                     continue;
                 }
@@ -165,7 +172,10 @@ async fn set_one(
                 attempt += 1;
                 continue;
             }
-            bail!("thumbnails.set 401 for video {} after retries: {txt}", job.youtube_id);
+            bail!(
+                "thumbnails.set 401 for video {} after retries: {txt}",
+                job.youtube_id
+            );
         }
 
         // 403: almost always the channel isn't phone-verified, so custom
@@ -185,19 +195,26 @@ async fn set_one(
             if attempt < cfg.max_retries {
                 attempt += 1;
                 throttle
-                    .backoff(attempt, std::time::Duration::from_millis(500),
-                             std::time::Duration::from_secs(30))
+                    .backoff(
+                        attempt,
+                        std::time::Duration::from_millis(500),
+                        std::time::Duration::from_secs(30),
+                    )
                     .await;
                 continue;
             }
             bail!(
                 "thumbnails.set {status} for video {} after {} retries: {txt}",
-                job.youtube_id, cfg.max_retries
+                job.youtube_id,
+                cfg.max_retries
             );
         }
 
         // Anything else (400, 404): not retryable, fail with the body.
-        bail!("thumbnails.set returned {status} for video {}: {txt}", job.youtube_id);
+        bail!(
+            "thumbnails.set returned {status} for video {}: {txt}",
+            job.youtube_id
+        );
     }
 }
 

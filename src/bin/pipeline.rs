@@ -97,7 +97,10 @@ impl FromStr for Stage {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "pipeline", about = "Faceless YouTube pipeline orchestrator + ops CLI")]
+#[command(
+    name = "pipeline",
+    about = "Faceless YouTube pipeline orchestrator + ops CLI"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -182,10 +185,10 @@ async fn main() -> Result<()> {
 /// Load config and ensure the schema/migrations are in place. Every subcommand
 /// starts here so a fresh checkout can run any verb without a separate setup.
 fn boot(config_path: &str) -> Result<AppConfig> {
-    let cfg = AppConfig::load(config_path)
-        .with_context(|| format!("loading config {config_path}"))?;
-    let conn = db::open_and_init(&cfg.db_path)
-        .context("initializing database / running migrations")?;
+    let cfg =
+        AppConfig::load(config_path).with_context(|| format!("loading config {config_path}"))?;
+    let conn =
+        db::open_and_init(&cfg.db_path).context("initializing database / running migrations")?;
     db::set_channel_meta(&conn, &cfg.channel.niche, &cfg.channel.format)
         .context("stamping channel_meta")?;
     Ok(cfg)
@@ -197,8 +200,8 @@ fn boot(config_path: &str) -> Result<AppConfig> {
 
 async fn cmd_run(args: RunArgs) -> Result<()> {
     let cfg = boot(&args.config)?;
-    let conn = db::open_and_init(&cfg.db_path)
-        .with_context(|| format!("opening db {}", cfg.db_path))?;
+    let conn =
+        db::open_and_init(&cfg.db_path).with_context(|| format!("opening db {}", cfg.db_path))?;
 
     // Resolve which stages to run.
     let plan: Vec<Stage> = match (args.stage, args.stages.clone()) {
@@ -218,7 +221,10 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         "=== pipeline run :: niche='{}' :: limit={} :: stages=[{}] ===",
         cfg.channel.name,
         args.limit,
-        plan.iter().map(|s| s.label()).collect::<Vec<_>>().join(" -> ")
+        plan.iter()
+            .map(|s| s.label())
+            .collect::<Vec<_>>()
+            .join(" -> ")
     );
 
     for stage in plan {
@@ -335,7 +341,10 @@ fn cmd_status(args: CommonArgs) -> Result<()> {
     let cfg = boot(&args.config)?;
     let conn = db::open_and_init(&cfg.db_path)?;
 
-    println!("=== state :: niche='{}' :: db='{}' ===", cfg.channel.name, cfg.db_path);
+    println!(
+        "=== state :: niche='{}' :: db='{}' ===",
+        cfg.channel.name, cfg.db_path
+    );
     println!(
         "{:<10} {:>8} {:>8} {:>8} {:>8}",
         "stage", "pending", "running", "done", "failed"

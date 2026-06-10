@@ -150,8 +150,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let plan = resolve_stage_plan(&args);
-    let configs = discover_configs(&args)
-        .context("resolving niche configs")?;
+    let configs = discover_configs(&args).context("resolving niche configs")?;
 
     if configs.is_empty() {
         anyhow::bail!(
@@ -164,7 +163,10 @@ async fn main() -> Result<()> {
         "=== orchestrator up :: {} niche(s) :: max_parallel={} :: stages=[{}] :: loop={} ===",
         configs.len(),
         args.max_parallel,
-        plan.iter().map(|s| s.label()).collect::<Vec<_>>().join(" -> "),
+        plan.iter()
+            .map(|s| s.label())
+            .collect::<Vec<_>>()
+            .join(" -> "),
         args.r#loop,
     );
 
@@ -239,16 +241,12 @@ async fn run_sweep(configs: &[PathBuf], plan: &[Stage], args: &Args) {
 /// A stage erroring is recorded and the chain stops for *this niche only*
 /// (downstream stages would run on bad upstream data otherwise). Returns
 /// (stages_passed, stages_failed) for the sweep summary.
-async fn run_niche(
-    cfg_path: &Path,
-    plan: &[Stage],
-    limit: usize,
-) -> Result<(usize, usize)> {
+async fn run_niche(cfg_path: &Path, plan: &[Stage], limit: usize) -> Result<(usize, usize)> {
     let cfg = AppConfig::load(cfg_path.to_str().context("non-utf8 config path")?)
         .with_context(|| format!("loading {}", cfg_path.display()))?;
 
-    let conn = db::open_and_init(&cfg.db_path)
-        .with_context(|| format!("opening db {}", cfg.db_path))?;
+    let conn =
+        db::open_and_init(&cfg.db_path).with_context(|| format!("opening db {}", cfg.db_path))?;
     db::set_channel_meta(&conn, &cfg.channel.niche, &cfg.channel.format)
         .context("stamping channel_meta")?;
 

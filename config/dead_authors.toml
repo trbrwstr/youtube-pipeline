@@ -15,9 +15,11 @@ default_interval_ms = 200
 "googleapis.com"        = 500
 
 [auth]
+# Per-channel refresh token — minted with oauth_bootstrap while logged into the
+# Dead Authors channel. Shares the same OAuth app (client id/secret).
 client_id     = "${YT_CLIENT_ID}"
 client_secret = "${YT_CLIENT_SECRET}"
-refresh_token = "${YT_REFRESH_TOKEN}"
+refresh_token = "${YT_REFRESH_TOKEN_DEAD_AUTHORS}"
 
 [ingest]
 language        = "en"
@@ -49,8 +51,14 @@ cache_dir    = "cache/audio"
 timeout_secs = 60
 
 [assemble]
-background_image = "assets/dead_authors_bg_1080x1920.png"
-out_dir          = "data/video_dead_authors"
+background_image  = "assets/dead_authors_bg_1080x1920.png"
+out_dir           = "data/video_dead_authors"
+# A distinct look from Forgotten Classics: bolder amber caption, higher up.
+font_size         = 64
+font_color        = "#f5d061"
+box_color         = "black@0.7"
+caption_bottom_px = 300
+# font_file        = "assets/fonts/Oswald-Bold.ttf"
 
 [metadata]
 api_base        = "https://api.openai.com/v1"

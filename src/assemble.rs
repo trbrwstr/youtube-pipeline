@@ -8,13 +8,15 @@ use tokio::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct AssembleInput {
-    pub audio: PathBuf,        // from tts::synthesize
-    pub background: PathBuf,    // still image, ideally 1080x1920
-    pub out: PathBuf,           // final mp4
-    pub duration_secs: f32,     // from ScriptFrame
+    pub audio: PathBuf,      // from tts::synthesize
+    pub background: PathBuf, // still image, ideally 1080x1920
+    pub out: PathBuf,        // final mp4
+    pub duration_secs: f32,  // from ScriptFrame
 }
 
-/// `[assemble]` — the per-niche render settings that aren't per-book.
+/// `[assemble]` — the per-niche render template. Only `background_image` is
+/// required; every styling knob defaults so a channel can override just the
+/// pieces it wants to look distinct (font, colors, caption position).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssembleConfig {
     /// Still image looped behind the narration (ideally 1080x1920).
@@ -22,18 +24,84 @@ pub struct AssembleConfig {
     /// Directory the rendered mp4 + extracted thumbnail land in.
     #[serde(default = "default_out_dir")]
     pub out_dir: String,
+    /// Caption font size in px.
+    #[serde(default = "default_font_size")]
+    pub font_size: u32,
+    /// Caption fill color (any ffmpeg color: "white", "#ffcc00", ...).
+    #[serde(default = "default_font_color")]
+    pub font_color: String,
+    /// Caption background box color, e.g. "black@0.55".
+    #[serde(default = "default_box_color")]
+    pub box_color: String,
+    /// Optional .ttf/.otf font file. When unset, ffmpeg's default font is used.
+    #[serde(default)]
+    pub font_file: Option<String>,
+    /// Caption baseline offset from the bottom edge, in px.
+    #[serde(default = "default_caption_bottom")]
+    pub caption_bottom_px: u32,
 }
 
-fn default_out_dir() -> String { "data/video".to_string() }
+fn default_out_dir() -> String {
+    "data/video".to_string()
+}
+fn default_font_size() -> u32 {
+    58
+}
+fn default_font_color() -> String {
+    "white".to_string()
+}
+fn default_box_color() -> String {
+    "black@0.55".to_string()
+}
+fn default_caption_bottom() -> u32 {
+    220
+}
+
+impl AssembleConfig {
+    fn caption_style(&self) -> CaptionStyle {
+        CaptionStyle {
+            font_size: self.font_size,
+            font_color: self.font_color.clone(),
+            box_color: self.box_color.clone(),
+            font_file: self.font_file.clone(),
+            bottom_px: self.caption_bottom_px,
+        }
+    }
+}
+
+/// Resolved per-render caption styling handed to the ffmpeg drawtext filter.
+#[derive(Debug, Clone)]
+pub struct CaptionStyle {
+    pub font_size: u32,
+    pub font_color: String,
+    pub box_color: String,
+    pub font_file: Option<String>,
+    pub bottom_px: u32,
+}
+
+impl Default for CaptionStyle {
+    fn default() -> Self {
+        Self {
+            font_size: default_font_size(),
+            font_color: default_font_color(),
+            box_color: default_box_color(),
+            font_file: None,
+            bottom_px: default_caption_bottom(),
+        }
+    }
+}
 
 /// Probe audio duration via ffprobe so the video length matches the narration
 /// exactly, regardless of what the ScriptFrame estimate said.
 pub(crate) async fn probe_duration(audio: &Path) -> Result<f32> {
     let output = Command::new("ffprobe")
         .args([
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
         ])
         .arg(audio)
         .stdout(Stdio::piped())
@@ -56,15 +124,22 @@ pub(crate) async fn probe_duration(audio: &Path) -> Result<f32> {
 }
 
 /// Build the final short: loop the still for the audio's length, overlay a
-/// burned-in caption, mux the narration, encode to vertical H.264.
-pub async fn assemble_short(input: &AssembleInput, caption: &str) -> Result<PathBuf> {
+/// burned-in caption styled per `style`, mux the narration, encode to vertical
+/// H.264.
+pub async fn assemble_short(
+    input: &AssembleInput,
+    caption: &str,
+    style: &CaptionStyle,
+) -> Result<PathBuf> {
     if let Some(parent) = input.out.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .with_context(|| format!("creating output dir {}", parent.display()))?;
     }
 
-    let dur = probe_duration(&input.audio).await.unwrap_or(input.duration_secs);
+    let dur = probe_duration(&input.audio)
+        .await
+        .unwrap_or(input.duration_secs);
 
     // Escape the caption for ffmpeg's drawtext: colons, single quotes, and
     // backslashes all bite you here.
@@ -73,26 +148,48 @@ pub async fn assemble_short(input: &AssembleInput, caption: &str) -> Result<Path
         .replace(':', "\\:")
         .replace('\'', "\u{2019}"); // swap straight apostrophe for a curly one
 
+    // Optional custom font; the path itself needs colon-escaping for the filter.
+    let fontfile = match &style.font_file {
+        Some(p) => format!(
+            "fontfile='{}':",
+            p.replace('\\', "\\\\").replace(':', "\\:")
+        ),
+        None => String::new(),
+    };
+
     let vf = format!(
         "scale=1080:1920:force_original_aspect_ratio=increase,\
          crop=1080:1920,\
-         drawtext=text='{safe}':fontcolor=white:fontsize=58:\
-         box=1:boxcolor=black@0.55:boxborderw=24:\
-         x=(w-text_w)/2:y=h-text_h-220:line_spacing=12"
+         drawtext={fontfile}text='{safe}':fontcolor={color}:fontsize={size}:\
+         box=1:boxcolor={box_color}:boxborderw=24:\
+         x=(w-text_w)/2:y=h-text_h-{bottom}:line_spacing=12",
+        color = style.font_color,
+        size = style.font_size,
+        box_color = style.box_color,
+        bottom = style.bottom_px,
     );
 
     let status = Command::new("ffmpeg")
         .args(["-y", "-loop", "1"])
-        .arg("-i").arg(&input.background)
-        .arg("-i").arg(&input.audio)
+        .arg("-i")
+        .arg(&input.background)
+        .arg("-i")
+        .arg(&input.audio)
         .args([
-            "-t", &format!("{dur:.2}"),
-            "-vf", &vf,
-            "-c:v", "libx264",
-            "-tune", "stillimage",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "192k",
+            "-t",
+            &format!("{dur:.2}"),
+            "-vf",
+            &vf,
+            "-c:v",
+            "libx264",
+            "-tune",
+            "stillimage",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
             "-shortest",
         ])
         .arg(&input.out)
@@ -114,7 +211,8 @@ pub async fn assemble_short(input: &AssembleInput, caption: &str) -> Result<Path
 async fn extract_thumb(video: &Path, out: &Path) -> Result<PathBuf> {
     let status = Command::new("ffmpeg")
         .args(["-y", "-ss", "1"])
-        .arg("-i").arg(video)
+        .arg("-i")
+        .arg(video)
         .args(["-frames:v", "1", "-q:v", "3"])
         .arg(out)
         .stdout(Stdio::null())
@@ -122,7 +220,12 @@ async fn extract_thumb(video: &Path, out: &Path) -> Result<PathBuf> {
         .status()
         .await
         .context("spawning ffmpeg for thumbnail")?;
-    if status.success() && tokio::fs::metadata(out).await.map(|m| m.len() > 0).unwrap_or(false) {
+    if status.success()
+        && tokio::fs::metadata(out)
+            .await
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+    {
         Ok(out.to_path_buf())
     } else {
         Err(anyhow!("thumbnail extraction produced no file"))
@@ -153,7 +256,12 @@ pub async fn run_one(conn: &Connection, cfg: &AssembleConfig, book_id: i64) -> R
 
     // Idempotency: already rendered and the file is still on disk.
     if let Some(p) = output_path {
-        if !p.is_empty() && tokio::fs::metadata(&p).await.map(|m| m.len() > 0).unwrap_or(false) {
+        if !p.is_empty()
+            && tokio::fs::metadata(&p)
+                .await
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
             return Ok(());
         }
     }
@@ -174,7 +282,7 @@ pub async fn run_one(conn: &Connection, cfg: &AssembleConfig, book_id: i64) -> R
         out: out.clone(),
         duration_secs: audio_secs.unwrap_or(0.0),
     };
-    assemble_short(&input, &caption).await?;
+    assemble_short(&input, &caption, &cfg.caption_style()).await?;
 
     // Best-effort thumbnail; absence is not fatal (thumbnail stage will skip).
     let thumb = PathBuf::from(&cfg.out_dir).join(format!("{book_id}.jpg"));

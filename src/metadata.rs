@@ -22,11 +22,21 @@ pub struct MetadataConfig {
     pub channel_blurb: String,
 }
 
-fn default_timeout() -> u64 { 30 }
-fn default_concurrency() -> usize { 3 }
-fn default_title_chars() -> usize { 100 }
-fn default_desc_chars() -> usize { 5000 }
-fn default_max_tags() -> usize { 15 }
+fn default_timeout() -> u64 {
+    30
+}
+fn default_concurrency() -> usize {
+    3
+}
+fn default_title_chars() -> usize {
+    100
+}
+fn default_desc_chars() -> usize {
+    5000
+}
+fn default_max_tags() -> usize {
+    15
+}
 
 impl MetadataConfig {
     pub fn load(path: &str) -> Result<Self> {
@@ -47,8 +57,7 @@ fn resolve_env_vars(input: &str) -> Result<String> {
             .find('}')
             .ok_or_else(|| anyhow!("unterminated ${{...}} in config"))?;
         let var = &after[..end];
-        let val = std::env::var(var)
-            .with_context(|| format!("env var {var} not set"))?;
+        let val = std::env::var(var).with_context(|| format!("env var {var} not set"))?;
         out.push_str(&val);
         rest = &after[end + 1..];
     }
@@ -162,14 +171,21 @@ pub fn build_metadata_deterministic(cfg: &MetadataConfig, book: &BookMeta) -> Vi
     ]);
     dedup_truncate_tags(&mut tags, cfg.max_tags);
 
-    VideoMetadata { title, description, tags }
+    VideoMetadata {
+        title,
+        description,
+        tags,
+    }
 }
 
 pub async fn build_metadata_llm(cfg: &MetadataConfig, book: &BookMeta) -> VideoMetadata {
     match try_llm(cfg, book).await {
         Ok(meta) => meta,
         Err(e) => {
-            eprintln!("llm metadata failed for {} ({e:#}); using fallback", book.book_id);
+            eprintln!(
+                "llm metadata failed for {} ({e:#}); using fallback",
+                book.book_id
+            );
             build_metadata_deterministic(cfg, book)
         }
     }
@@ -190,8 +206,16 @@ keywords). Do not invent facts about the book.";
         "Book title: {}\nAuthor: {}\nGutenberg subjects: {}\nApproved hook line: {}\n\n\
 Write the metadata. The title may reuse or sharpen the hook. Keep title under {} characters.",
         book.title,
-        if book.author.is_empty() { "(unknown)" } else { &book.author },
-        if book.subjects.is_empty() { "(none)" } else { &book.subjects },
+        if book.author.is_empty() {
+            "(unknown)"
+        } else {
+            &book.author
+        },
+        if book.subjects.is_empty() {
+            "(none)"
+        } else {
+            &book.subjects
+        },
         book.hook_text,
         cfg.max_title_chars,
     );
@@ -199,15 +223,26 @@ Write the metadata. The title may reuse or sharpen the hook. Keep title under {}
     let req = ChatRequest {
         model: &cfg.model,
         messages: vec![
-            ChatMessage { role: "system", content: system },
-            ChatMessage { role: "user", content: &user },
+            ChatMessage {
+                role: "system",
+                content: system,
+            },
+            ChatMessage {
+                role: "user",
+                content: &user,
+            },
         ],
         temperature: 0.8,
-        response_format: ResponseFormat { kind: "json_object" },
+        response_format: ResponseFormat {
+            kind: "json_object",
+        },
     };
 
     let resp = client
-        .post(format!("{}/chat/completions", cfg.api_base.trim_end_matches('/')))
+        .post(format!(
+            "{}/chat/completions",
+            cfg.api_base.trim_end_matches('/')
+        ))
         .bearer_auth(&cfg.api_key)
         .json(&req)
         .send()
@@ -220,8 +255,7 @@ Write the metadata. The title may reuse or sharpen the hook. Keep title under {}
         return Err(anyhow!("api returned {}: {}", status, body.trim()));
     }
 
-    let parsed: ChatResponse =
-        serde_json::from_str(&body).context("parsing chat envelope")?;
+    let parsed: ChatResponse = serde_json::from_str(&body).context("parsing chat envelope")?;
     let content = parsed
         .choices
         .first()
@@ -230,8 +264,7 @@ Write the metadata. The title may reuse or sharpen the hook. Keep title under {}
         .content
         .as_str();
 
-    let llm: LlmMeta =
-        serde_json::from_str(content).context("parsing model JSON content")?;
+    let llm: LlmMeta = serde_json::from_str(content).context("parsing model JSON content")?;
 
     let title = truncate_clean(&llm.title, cfg.max_title_chars);
     let mut description = llm.description;
@@ -248,7 +281,11 @@ Write the metadata. The title may reuse or sharpen the hook. Keep title under {}
         return Err(anyhow!("model returned empty title or description"));
     }
 
-    Ok(VideoMetadata { title, description, tags })
+    Ok(VideoMetadata {
+        title,
+        description,
+        tags,
+    })
 }
 
 fn truncate_clean(s: &str, max_chars: usize) -> String {
@@ -270,9 +307,7 @@ fn truncate_clean(s: &str, max_chars: usize) -> String {
         out.push_str(word);
         count += wlen;
     }
-    out.trim_end_matches([',', '-', '—'])
-        .trim()
-        .to_string()
+    out.trim_end_matches([',', '-', '—']).trim().to_string()
 }
 
 fn dedup_truncate_tags(tags: &mut Vec<String>, max_tags: usize) {
@@ -306,9 +341,12 @@ pub async fn run_one(conn: &Connection, cfg: &MetadataConfig, book_id: i64) -> R
 }
 
 fn fetch_one(db: &Connection, book_id: i64) -> Result<BookMeta> {
-    db.execute_batch("ALTER TABLE script_frames ADD COLUMN yt_title TEXT;").ok();
-    db.execute_batch("ALTER TABLE script_frames ADD COLUMN yt_description TEXT;").ok();
-    db.execute_batch("ALTER TABLE script_frames ADD COLUMN yt_tags TEXT;").ok();
+    db.execute_batch("ALTER TABLE script_frames ADD COLUMN yt_title TEXT;")
+        .ok();
+    db.execute_batch("ALTER TABLE script_frames ADD COLUMN yt_description TEXT;")
+        .ok();
+    db.execute_batch("ALTER TABLE script_frames ADD COLUMN yt_tags TEXT;")
+        .ok();
 
     db.query_row(
         "SELECT sf.book_id, b.title, b.author, sf.hook_text, COALESCE(b.subjects, '') \

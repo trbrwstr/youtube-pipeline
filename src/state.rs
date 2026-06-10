@@ -55,8 +55,9 @@ use std::collections::BTreeMap;
 /// so a perpetually-crashing item eventually hits `dead`.
 pub fn reap_stale(conn: &Connection, stale_secs: i64, max_attempts: i64) -> Result<usize> {
     // failed if under the attempt ceiling, dead if it's burned through them.
-    let n = conn.execute(
-        "UPDATE pipeline_state
+    let n = conn
+        .execute(
+            "UPDATE pipeline_state
             SET status = CASE
                     WHEN attempts + 1 >= ?2 THEN 'dead'
                     ELSE 'failed'
@@ -66,9 +67,9 @@ pub fn reap_stale(conn: &Connection, stale_secs: i64, max_attempts: i64) -> Resu
                 updated_at = strftime('%s','now')
           WHERE status = 'running'
             AND updated_at < strftime('%s','now') - ?1",
-        params![stale_secs, max_attempts],
-    )
-    .context("reaping stale running rows")?;
+            params![stale_secs, max_attempts],
+        )
+        .context("reaping stale running rows")?;
     Ok(n)
 }
 
@@ -99,16 +100,17 @@ pub fn stage_counts(conn: &Connection) -> Result<BTreeMap<(String, String), i64>
 /// `--stage X` run reprocesses them. Deliberately does NOT touch `dead` rows —
 /// those exceeded max_attempts and need manual eyes. Returns rows re-queued.
 pub fn retry_stage(conn: &Connection, stage: &str) -> Result<usize> {
-    let n = conn.execute(
-        "UPDATE pipeline_state
+    let n = conn
+        .execute(
+            "UPDATE pipeline_state
             SET status = 'pending',
                 last_error = NULL,
                 updated_at = strftime('%s','now')
           WHERE stage = ?1
             AND status = 'failed'",
-        params![stage],
-    )
-    .context("re-queuing failed rows")?;
+            params![stage],
+        )
+        .context("re-queuing failed rows")?;
     Ok(n)
 }
 
@@ -296,9 +298,8 @@ pub fn mark_failed(
 
 /// Counts by status for a single stage (the ops `status` grid row).
 pub fn stage_counts_for(conn: &Connection, stage: &str) -> Result<StageCounts> {
-    let mut stmt = conn.prepare(
-        "SELECT status, COUNT(*) FROM pipeline_state WHERE stage = ?1 GROUP BY status",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT status, COUNT(*) FROM pipeline_state WHERE stage = ?1 GROUP BY status")?;
     let rows = stmt.query_map(params![stage], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     })?;

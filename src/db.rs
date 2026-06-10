@@ -27,8 +27,7 @@ pub fn open_and_init(path: &str) -> Result<Connection> {
                 .with_context(|| format!("creating db dir {}", parent.display()))?;
         }
     }
-    let conn = Connection::open(path)
-        .with_context(|| format!("opening db {path}"))?;
+    let conn = Connection::open(path).with_context(|| format!("opening db {path}"))?;
     apply_pragmas(&conn)?;
     init(&conn)?;
     Ok(conn)
@@ -281,7 +280,8 @@ fn migrate_additive(conn: &Connection) -> Result<()> {
         match conn.execute(&sql, []) {
             Ok(_) => {}
             Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
-                if msg.contains("duplicate column name") => { /* already present */ }
+                if msg.contains("duplicate column name") =>
+            { /* already present */ }
             Err(e) => return Err(e).with_context(|| format!("ALTER {table}: {coldef}")),
         }
     }
