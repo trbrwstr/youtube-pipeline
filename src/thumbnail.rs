@@ -14,7 +14,6 @@
 // draws from the SAME daily 10k pool as upload — budget them together.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
@@ -24,11 +23,7 @@ use serde::Deserialize;
 
 use crate::auth::{self, OAuthConfig};
 use crate::config::AuthConfig;
-use crate::state;
 use crate::throttle::Throttle;
-
-/// Stage key used in pipeline_state. Must match what selector/state expect.
-const STAGE: &str = "thumbnail";
 
 /// Stable host key so thumbnail + upload share one googleapis pacing floor.
 const HOST: &str = "googleapis.com";
@@ -197,7 +192,7 @@ async fn set_one(
             }
             bail!(
                 "thumbnails.set {status} for video {} after {} retries: {txt}",
-                job.youtube_id, cfg.max_retries, txt
+                job.youtube_id, cfg.max_retries
             );
         }
 
@@ -218,8 +213,8 @@ fn hydrate_job(conn: &Connection, book_id: i64) -> Result<Option<ThumbJob>> {
     let row = conn
         .query_row(
             "SELECT youtube_id, thumb_path
-             FROM books
-             WHERE id = ?1",
+             FROM script_frames
+             WHERE book_id = ?1",
             params![book_id],
             |row| {
                 let yt: Option<String> = row.get(0)?;
@@ -247,19 +242,33 @@ fn hydrate_job(conn: &Connection, book_id: i64) -> Result<Option<ThumbJob>> {
 use rusqlite::OptionalExtension;
 
 // ============================================================
-//  Batch runner — state-gated, throttled, resumable
+//  Stage entry point — per-item, state-gated by the runner loop
 // ============================================================
 
-/// Pull books eligible for the thumbnail stage, set each custom thumbnail,
-/// and record terminal state through state.rs. Same shape and signature
-/// family as upload::run_batch so pipeline.rs dispatches them identically.
-pub async fn run_batch(
-    db_path: &str,
+/// Set the custom thumbnail for one already-uploaded book. Idempotent — a frame
+/// whose `thumb_set` flag is already on is a no-op. A book missing its
+/// youtube_id or thumb_path errors so it lands in the dead-letter queue.
+pub async fn run_one(
+    conn: &Connection,
     auth_cfg: &AuthConfig,
     cfg: &ThumbnailConfig,
-    throttle: Throttle,
-    limit: usize,
-) -> Result<usize> {
+    book_id: i64,
+) -> Result<()> {
+    let already_set: Option<i64> = conn
+        .query_row(
+            "SELECT thumb_set FROM script_frames WHERE book_id = ?1",
+            params![book_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .with_context(|| format!("checking thumb_set for book {book_id}"))?;
+    if already_set == Some(1) {
+        return Ok(());
+    }
+
+    let job = hydrate_job(conn, book_id)?
+        .ok_or_else(|| anyhow::anyhow!("missing youtube_id or thumb_path at thumbnail stage"))?;
+
     let oauth = OAuthConfig::from_values(
         &auth_cfg.client_id,
         &auth_cfg.client_secret,
@@ -267,97 +276,19 @@ pub async fn run_batch(
     )
     .context("building OAuthConfig for thumbnail stage")?;
 
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("opening db {db_path}"))?;
-
-    // state.rs decides who's eligible: upload done, thumbnail not yet done,
-    // not currently running, not dead-lettered past retry budget.
-    let eligible = state::eligible_for_stage(&conn, STAGE, limit)
-        .context("querying thumbnail-eligible books")?;
-
-    if eligible.is_empty() {
-        eprintln!("thumbnail: nothing eligible");
-        return Ok(0);
-    }
-    eprintln!("thumbnail: {} eligible", eligible.len());
-
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(cfg.request_timeout_secs))
         .build()?;
+    let throttle = Throttle::from_default();
 
-    let client = Arc::new(client);
-    let oauth = Arc::new(oauth);
-    let cfg = Arc::new(cfg.clone());
+    set_one(&client, &oauth, &throttle, cfg, &job).await?;
 
-    // Hydrate + spawn. Concurrency is bounded by the shared Throttle's global
-    // semaphore, so we can spawn all of them and let acquire() meter the flow
-    // rather than maintaining a second local semaphore here.
-    let mut handles = Vec::new();
-    for book_id in eligible {
-        // Claim the row BEFORE spawning so a crash leaves it 'running' for
-        // reap_stale to recover, never silently lost.
-        state::mark_running(&conn, STAGE, book_id)
-            .with_context(|| format!("mark_running thumbnail book {book_id}"))?;
-
-        let job = match hydrate_job(&conn, book_id)? {
-            Some(j) => j,
-            None => {
-                // Prereqs missing (no youtube_id / no thumb_path). Mark failed
-                // with a clear reason so it lands in dead_letters for triage,
-                // not stuck 'running'.
-                state::mark_failed(
-                    &conn,
-                    STAGE,
-                    book_id,
-                    "missing youtube_id or thumb_path at thumbnail stage",
-                )?;
-                continue;
-            }
-        };
-
-        let client = client.clone();
-        let oauth = oauth.clone();
-        let cfg = cfg.clone();
-        let throttle = throttle.clone();
-
-        handles.push((
-            book_id,
-            tokio::spawn(async move {
-                set_one(&client, &oauth, &throttle, &cfg, &job).await
-            }),
-        ));
-    }
-
-    // Collect results, recording terminal state on the main thread's conn so
-    // SQLite writes stay serialized (one connection, no WAL contention here).
-    let mut succeeded = 0usize;
-    for (book_id, handle) in handles {
-        match handle.await {
-            Ok(Ok(())) => {
-                state::mark_done(&conn, STAGE, book_id)
-                    .with_context(|| format!("mark_done thumbnail book {book_id}"))?;
-                eprintln!("thumbnail: book {book_id} -> set");
-                succeeded += 1;
-            }
-            Ok(Err(e)) => {
-                state::mark_failed(&conn, STAGE, book_id, &format!("{e:#}"))
-                    .with_context(|| format!("mark_failed thumbnail book {book_id}"))?;
-                eprintln!("thumbnail: book {book_id} FAILED: {e:#}");
-            }
-            Err(join_err) => {
-                state::mark_failed(
-                    &conn,
-                    STAGE,
-                    book_id,
-                    &format!("task panicked: {join_err}"),
-                )?;
-                eprintln!("thumbnail: book {book_id} task panicked: {join_err}");
-            }
-        }
-    }
-
-    eprintln!("thumbnail: {succeeded} succeeded");
-    Ok(succeeded)
+    conn.execute(
+        "UPDATE script_frames SET thumb_set = 1 WHERE book_id = ?1",
+        params![book_id],
+    )
+    .with_context(|| format!("marking thumb_set for book {book_id}"))?;
+    Ok(())
 }
 
 #[cfg(test)]

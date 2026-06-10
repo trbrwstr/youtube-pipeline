@@ -47,6 +47,13 @@ struct HostState {
 }
 
 impl Throttle {
+    /// Sensible standalone limiter for stages that construct their own (4
+    /// concurrent, 200ms default host floor). Used by the per-item `run_one`
+    /// entry points, which each build a throttle rather than sharing one.
+    pub fn from_default() -> Self {
+        Self::new(4, Duration::from_millis(200))
+    }
+
     /// `permits` = global ceiling on concurrent requests. `default_interval`
     /// is the floor applied to any host without an explicit policy.
     pub fn new(permits: usize, default_interval: Duration) -> Self {

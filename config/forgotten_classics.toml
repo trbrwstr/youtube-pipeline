@@ -1,4 +1,5 @@
 db_path = "./data/forgotten_classics.db"
+max_attempts = 3        # per-book stage failures before dead-lettering
 
 [channel]
 name   = "Forgotten Classics"
@@ -38,3 +39,55 @@ Forgotten Classics — public-domain books, distilled.
 
 New videos weekly. Subscribe for more dead authors, live ideas.
 """
+
+[ingest]
+language        = "en"
+max_issued_year = 1928
+cache_dir       = "cache"
+fetch_text      = true
+
+[hook]
+api_base      = "https://api.openai.com/v1"
+api_key       = "${OPENAI_API_KEY}"
+model         = "gpt-4o-mini"
+wpm           = 150.0
+max_hook_secs = 8.0
+system_prompt = """
+You are a hook writer for a Forgotten Classics YouTube channel. Tone: hushed, \
+reverent, a little ominous. Make century-old prose feel urgent and alive. \
+Never explain the book; tease it.
+"""
+timeout_secs  = 20
+concurrency   = 6
+
+[tts]
+api_base     = "https://api.openai.com/v1"
+api_key      = "${OPENAI_API_KEY}"
+model        = "tts-1"
+voice        = "onyx"
+format       = "mp3"
+speed        = 1.0
+cache_dir    = "cache/audio"
+timeout_secs = 60
+
+[assemble]
+background_image = "assets/classics_bg_1080x1920.png"
+out_dir          = "data/video"
+
+[thumbnail]
+max_retries          = 3
+request_timeout_secs = 60
+
+[upload]
+privacy_status = "unlisted"
+category_id    = "27"
+made_for_kids  = false
+chunk_bytes    = 8388608
+timeout_secs   = 120
+
+[selector]
+total_budget   = 100
+min_per_niche  = 5
+max_per_niche  = 60
+min_sample     = 10
+exploit_weight = 0.7

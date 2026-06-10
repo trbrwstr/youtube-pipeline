@@ -23,7 +23,8 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use youtube_pipeline::{
-    assemble, config::AppConfig, hook, ingest, metadata, state, thumbnail, tts, upload,
+    assemble, config::AppConfig, db, hook, ingest, metadata, selector, state, thumbnail, tts,
+    upload,
 };
 
 // ============================================================
@@ -197,47 +198,37 @@ async fn main() -> Result<()> {
 /// down the whole fleet.
 async fn run_sweep(configs: &[PathBuf], plan: &[Stage], args: &Args) {
     let sem = Arc::new(Semaphore::new(args.max_parallel.max(1)));
-    let plan = Arc::new(plan.to_vec());
-    let mut handles = Vec::with_capacity(configs.len());
 
-    for (idx, cfg_path) in configs.iter().cloned().enumerate() {
+    // Niche futures run concurrently on this task rather than via tokio::spawn:
+    // each opens its own rusqlite::Connection, which is Send but not Sync, so a
+    // `&Connection` held across an await can't satisfy spawn's Send bound. The
+    // shared semaphore still caps how many niches touch their chains at once.
+    let niches = configs.iter().cloned().enumerate().map(|(idx, cfg_path)| {
         let sem = Arc::clone(&sem);
-        let plan = Arc::clone(&plan);
-        let limit = args.limit;
         let stagger = Duration::from_millis(args.stagger_ms * idx as u64);
-
-        let handle = tokio::spawn(async move {
+        let limit = args.limit;
+        async move {
             // Stagger so all niches don't fire ingest at the exact same tick.
             tokio::time::sleep(stagger).await;
 
             // Acquire a slot; held until this niche's whole chain finishes.
-            let _permit = sem
-                .acquire()
-                .await
-                .expect("semaphore closed unexpectedly");
+            let _permit = sem.acquire().await.expect("semaphore closed unexpectedly");
 
             let niche = cfg_path
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "unknown".into());
 
-            match run_niche(&cfg_path, &plan, limit).await {
+            match run_niche(&cfg_path, plan, limit).await {
                 Ok((ok, failed)) => println!(
                     "[{niche}] sweep complete :: {ok} stage-pass(es) ok, {failed} stage(s) errored"
                 ),
                 Err(e) => eprintln!("[{niche}] niche aborted: {e:#}"),
             }
-        });
-
-        handles.push(handle);
-    }
-
-    // Join everything; a JoinError means the task panicked — log and move on.
-    for h in handles {
-        if let Err(join_err) = h.await {
-            eprintln!("!!! niche task panicked: {join_err}");
         }
-    }
+    });
+
+    futures::future::join_all(niches).await;
 }
 
 // ============================================================
@@ -256,8 +247,10 @@ async fn run_niche(
     let cfg = AppConfig::load(cfg_path.to_str().context("non-utf8 config path")?)
         .with_context(|| format!("loading {}", cfg_path.display()))?;
 
-    let conn = open_db(&cfg.db_path)
+    let conn = db::open_and_init(&cfg.db_path)
         .with_context(|| format!("opening db {}", cfg.db_path))?;
+    db::set_channel_meta(&conn, &cfg.channel.niche, &cfg.channel.format)
+        .context("stamping channel_meta")?;
 
     let niche = &cfg.channel.name;
     let (mut passed, mut failed) = (0usize, 0usize);
@@ -302,12 +295,26 @@ async fn run_stage(
     cfg: &AppConfig,
     limit: usize,
 ) -> Result<usize> {
+    // ingest is the one batch stage — there are no per-book ids before it runs.
+    if stage == Stage::Ingest {
+        return ingest::run_batch(&cfg.db_path, &cfg.ingest, produce_limit(conn, cfg, limit))
+            .await
+            .context("ingest stage");
+    }
+
+    // ingest + hook produce toward the selector's quota when one exists.
+    let effective_limit = if stage == Stage::Hook {
+        produce_limit(conn, cfg, limit)
+    } else {
+        limit
+    };
+
     let book_ids = state::eligible_for_stage(
         conn,
         stage.label(),
         stage.depends_on().map(|d| d.label()),
         cfg.max_attempts,
-        limit,
+        effective_limit,
     )
     .with_context(|| format!("selecting eligible items for {}", stage.label()))?;
 
@@ -343,7 +350,7 @@ async fn run_one(
     book_id: i64,
 ) -> Result<()> {
     match stage {
-        Stage::Ingest => ingest::run_one(conn, &cfg.ingest, book_id).await,
+        Stage::Ingest => unreachable!("ingest is handled as a batch in run_stage"),
         Stage::Hook => hook::run_one(conn, &cfg.hook, book_id).await,
         Stage::Tts => tts::run_one(conn, &cfg.tts, book_id).await,
         Stage::Assemble => assemble::run_one(conn, &cfg.assemble, book_id).await,
@@ -390,10 +397,12 @@ fn discover_configs(args: &Args) -> Result<Vec<PathBuf>> {
     Ok(configs)
 }
 
-fn open_db(path: &str) -> Result<rusqlite::Connection> {
-    let conn = rusqlite::Connection::open(path)
-        .with_context(|| format!("opening db {path}"))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "busy_timeout", 5000)?;
-    Ok(conn)
+/// Resolve the per-stage produce limit: the selector's quota for this niche
+/// when a plan exists, capped by the CLI ceiling; otherwise the ceiling itself.
+fn produce_limit(conn: &rusqlite::Connection, cfg: &AppConfig, ceiling: usize) -> usize {
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    match selector::quota_for(conn, &today, &cfg.channel.niche, &cfg.channel.format) {
+        Ok(Some(q)) if q > 0 => (q as usize).min(ceiling),
+        _ => ceiling,
+    }
 }

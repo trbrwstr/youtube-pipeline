@@ -25,7 +25,8 @@ use clap::{Parser, Subcommand};
 use std::str::FromStr;
 
 use youtube_pipeline::{
-    assemble, config::AppConfig, db, hook, ingest, metadata, state, thumbnail, tts, upload,
+    assemble, config::AppConfig, db, hook, ingest, metadata, selector, state, thumbnail, tts,
+    upload,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,19 @@ impl Stage {
             Stage::Metadata => "metadata",
             Stage::Thumbnail => "thumbnail",
             Stage::Upload => "upload",
+        }
+    }
+
+    /// Upstream stage that must be `done` before this one is eligible.
+    fn depends_on(&self) -> Option<Stage> {
+        match self {
+            Stage::Ingest => None,
+            Stage::Hook => Some(Stage::Ingest),
+            Stage::Tts => Some(Stage::Hook),
+            Stage::Assemble => Some(Stage::Tts),
+            Stage::Metadata => Some(Stage::Assemble),
+            Stage::Thumbnail => Some(Stage::Metadata),
+            Stage::Upload => Some(Stage::Thumbnail),
         }
     }
 }
@@ -170,7 +184,10 @@ async fn main() -> Result<()> {
 fn boot(config_path: &str) -> Result<AppConfig> {
     let cfg = AppConfig::load(config_path)
         .with_context(|| format!("loading config {config_path}"))?;
-    db::init(&cfg.db_path).context("initializing database / running migrations")?;
+    let conn = db::open_and_init(&cfg.db_path)
+        .context("initializing database / running migrations")?;
+    db::set_channel_meta(&conn, &cfg.channel.niche, &cfg.channel.format)
+        .context("stamping channel_meta")?;
     Ok(cfg)
 }
 
@@ -180,6 +197,8 @@ fn boot(config_path: &str) -> Result<AppConfig> {
 
 async fn cmd_run(args: RunArgs) -> Result<()> {
     let cfg = boot(&args.config)?;
+    let conn = db::open_and_init(&cfg.db_path)
+        .with_context(|| format!("opening db {}", cfg.db_path))?;
 
     // Resolve which stages to run.
     let plan: Vec<Stage> = match (args.stage, args.stages.clone()) {
@@ -206,7 +225,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         let started = std::time::Instant::now();
         println!("\n--- stage: {} ---", stage.label());
 
-        match run_stage(stage, &cfg, args.limit).await {
+        match run_stage(&conn, stage, &cfg, args.limit).await {
             Ok(n) => println!(
                 "--- {} done :: {} item(s) :: {:.1}s ---",
                 stage.label(),
@@ -231,37 +250,80 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Dispatch a single stage to its module. Each returns the count of items it
-/// actually processed this run (0 = nothing left to do, which is not an error).
-async fn run_stage(stage: Stage, cfg: &AppConfig, limit: usize) -> Result<usize> {
+/// Run one stage over its eligible items via the shared state machine. Ingest
+/// is the batch exception (no per-book id exists before it runs); every other
+/// stage claims items, runs `run_one`, and stamps terminal state. Returns the
+/// count of items processed this run (0 = nothing left to do — not an error).
+async fn run_stage(
+    conn: &rusqlite::Connection,
+    stage: Stage,
+    cfg: &AppConfig,
+    limit: usize,
+) -> Result<usize> {
+    if stage == Stage::Ingest {
+        return ingest::run_batch(&cfg.db_path, &cfg.ingest, produce_limit(conn, cfg, limit))
+            .await
+            .context("ingest stage");
+    }
+
+    let effective_limit = if stage == Stage::Hook {
+        produce_limit(conn, cfg, limit)
+    } else {
+        limit
+    };
+
+    let book_ids = state::eligible_for_stage(
+        conn,
+        stage.label(),
+        stage.depends_on().map(|d| d.label()),
+        cfg.max_attempts,
+        effective_limit,
+    )
+    .with_context(|| format!("selecting eligible items for {}", stage.label()))?;
+
+    let mut processed = 0usize;
+    for book_id in book_ids {
+        state::mark_running(conn, book_id, stage.label())?;
+        match run_one(stage, conn, cfg, book_id).await {
+            Ok(()) => {
+                state::mark_done(conn, book_id, stage.label())?;
+                processed += 1;
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                eprintln!("    book {book_id} :: {} failed: {msg}", stage.label());
+                state::mark_failed(conn, book_id, stage.label(), &msg, cfg.max_attempts)?;
+            }
+        }
+    }
+    Ok(processed)
+}
+
+/// Dispatch one item to its stage module. Mirrors orchestrator.rs so single-
+/// and multi-niche runs share identical per-item behavior.
+async fn run_one(
+    stage: Stage,
+    conn: &rusqlite::Connection,
+    cfg: &AppConfig,
+    book_id: i64,
+) -> Result<()> {
     match stage {
-        Stage::Ingest => ingest::run_batch(&cfg.db_path, &cfg.ingest, limit)
-            .await
-            .context("ingest stage"),
+        Stage::Ingest => unreachable!("ingest is handled as a batch in run_stage"),
+        Stage::Hook => hook::run_one(conn, &cfg.hook, book_id).await,
+        Stage::Tts => tts::run_one(conn, &cfg.tts, book_id).await,
+        Stage::Assemble => assemble::run_one(conn, &cfg.assemble, book_id).await,
+        Stage::Metadata => metadata::run_one(conn, &cfg.metadata, book_id).await,
+        Stage::Thumbnail => thumbnail::run_one(conn, &cfg.auth, &cfg.thumbnail, book_id).await,
+        Stage::Upload => upload::run_one(conn, &cfg.auth, &cfg.upload, book_id).await,
+    }
+}
 
-        Stage::Hook => hook::run_batch(&cfg.db_path, &cfg.hook, limit)
-            .await
-            .context("hook stage"),
-
-        Stage::Tts => tts::run_batch(&cfg.db_path, &cfg.tts, limit)
-            .await
-            .context("tts stage"),
-
-        Stage::Assemble => assemble::run_batch(&cfg.db_path, &cfg.assemble, limit)
-            .await
-            .context("assemble stage"),
-
-        Stage::Metadata => metadata::run_batch(&cfg.db_path, &cfg.metadata, limit)
-            .await
-            .context("metadata stage"),
-
-        Stage::Thumbnail => thumbnail::run_batch(&cfg.db_path, &cfg.auth, &cfg.thumbnail, limit)
-            .await
-            .context("thumbnail stage"),
-
-        Stage::Upload => upload::run_batch(&cfg.db_path, &cfg.auth, &cfg.upload, limit)
-            .await
-            .context("upload stage"),
+/// Selector quota for ingest/hook, capped by the CLI ceiling; else the ceiling.
+fn produce_limit(conn: &rusqlite::Connection, cfg: &AppConfig, ceiling: usize) -> usize {
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    match selector::quota_for(conn, &today, &cfg.channel.niche, &cfg.channel.format) {
+        Ok(Some(q)) if q > 0 => (q as usize).min(ceiling),
+        _ => ceiling,
     }
 }
 
@@ -271,7 +333,7 @@ async fn run_stage(stage: Stage, cfg: &AppConfig, limit: usize) -> Result<usize>
 
 fn cmd_status(args: CommonArgs) -> Result<()> {
     let cfg = boot(&args.config)?;
-    let conn = rusqlite::Connection::open(&cfg.db_path)?;
+    let conn = db::open_and_init(&cfg.db_path)?;
 
     println!("=== state :: niche='{}' :: db='{}' ===", cfg.channel.name, cfg.db_path);
     println!(
@@ -281,7 +343,7 @@ fn cmd_status(args: CommonArgs) -> Result<()> {
     println!("{}", "-".repeat(46));
 
     for stage in Stage::all() {
-        let c = state::stage_counts(&conn, stage.label())
+        let c = state::stage_counts_for(&conn, stage.label())
             .with_context(|| format!("counting state for {}", stage.label()))?;
         println!(
             "{:<10} {:>8} {:>8} {:>8} {:>8}",
@@ -302,9 +364,9 @@ fn cmd_status(args: CommonArgs) -> Result<()> {
 
 fn cmd_reap(args: ReapArgs) -> Result<()> {
     let cfg = boot(&args.config)?;
-    let conn = rusqlite::Connection::open(&cfg.db_path)?;
+    let conn = db::open_and_init(&cfg.db_path)?;
 
-    let reaped = state::reap_stale(&conn, args.stale_secs)
+    let reaped = state::reap_stale(&conn, args.stale_secs, cfg.max_attempts)
         .context("reaping stale running rows")?;
 
     println!(
@@ -320,7 +382,7 @@ fn cmd_reap(args: ReapArgs) -> Result<()> {
 
 fn cmd_retry(args: RetryArgs) -> Result<()> {
     let cfg = boot(&args.config)?;
-    let conn = rusqlite::Connection::open(&cfg.db_path)?;
+    let conn = db::open_and_init(&cfg.db_path)?;
 
     let revived = state::retry_stage(&conn, args.stage.label())
         .with_context(|| format!("retrying failed rows for {}", args.stage.label()))?;
@@ -338,9 +400,9 @@ fn cmd_retry(args: RetryArgs) -> Result<()> {
 
 fn cmd_dead(args: CommonArgs) -> Result<()> {
     let cfg = boot(&args.config)?;
-    let conn = rusqlite::Connection::open(&cfg.db_path)?;
+    let conn = db::open_and_init(&cfg.db_path)?;
 
-    let rows = state::dead_letters(&conn).context("listing dead-letter rows")?;
+    let rows = state::dead_letters(&conn, None, 200).context("listing dead-letter rows")?;
 
     if rows.is_empty() {
         println!("no dead-letter rows — nothing failed past max attempts");

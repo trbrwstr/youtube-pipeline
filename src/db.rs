@@ -19,6 +19,14 @@ use rusqlite::Connection;
 /// Open the DB at `path`, apply pragmas, run every migration. Call this once
 /// per process before any stage touches the connection.
 pub fn open_and_init(path: &str) -> Result<Connection> {
+    // Create the parent directory so a fresh checkout (where ./data/ doesn't
+    // exist yet) can open the DB instead of erroring with SQLITE_CANTOPEN.
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating db dir {}", parent.display()))?;
+        }
+    }
     let conn = Connection::open(path)
         .with_context(|| format!("opening db {path}"))?;
     apply_pragmas(&conn)?;
@@ -46,7 +54,24 @@ pub fn init(conn: &Connection) -> Result<()> {
     create_books(conn)?;
     create_script_frames(conn)?;
     create_pipeline_state(conn)?;
+    create_channel_meta(conn)?;
+    create_video_stats(conn)?;
+    create_production_plan(conn)?;
     migrate_additive(conn)?;
+    Ok(())
+}
+
+/// Stamp this DB's owning niche/format. Each niche has its own SQLite file, so
+/// a single row is enough to attribute every video in here to a (niche, format)
+/// — analytics joins against it instead of threading channel config through
+/// every stage. Idempotent upsert; the binaries call it right after open.
+pub fn set_channel_meta(conn: &Connection, niche: &str, format: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO channel_meta (id, niche, format) VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET niche = excluded.niche, format = excluded.format",
+        rusqlite::params![niche, format],
+    )
+    .context("setting channel_meta")?;
     Ok(())
 }
 
@@ -63,6 +88,7 @@ fn create_books(conn: &Connection) -> Result<()> {
             author        TEXT    NOT NULL DEFAULT 'Unknown',
             language      TEXT    NOT NULL DEFAULT 'en',
             issued_year   INTEGER,
+            subjects      TEXT    NOT NULL DEFAULT '',
             text_url      TEXT,
             body          TEXT,
             created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
@@ -169,6 +195,70 @@ fn create_pipeline_state(conn: &Connection) -> Result<()> {
 }
 
 // ============================================================
+// channel_meta — single-row niche attribution for this DB
+// ============================================================
+
+fn create_channel_meta(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS channel_meta (
+            id     INTEGER PRIMARY KEY CHECK (id = 1),  -- enforce one row
+            niche  TEXT NOT NULL,
+            format TEXT NOT NULL
+        );",
+    )
+    .context("creating channel_meta table")?;
+    Ok(())
+}
+
+// ============================================================
+// video_stats — per-video performance time series (analytics)
+// ============================================================
+//
+// One row per (video_id, snapshot_date). analytics appends a fresh snapshot
+// each run; selector reads the latest snapshot per video to score niches.
+
+fn create_video_stats(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS video_stats (
+            video_id            TEXT NOT NULL,
+            snapshot_date       TEXT NOT NULL,   -- ISO YYYY-MM-DD
+            views               INTEGER NOT NULL DEFAULT 0,
+            est_minutes_watched INTEGER NOT NULL DEFAULT 0,
+            avg_view_duration   REAL    NOT NULL DEFAULT 0,
+            avg_view_percentage REAL    NOT NULL DEFAULT 0,
+            likes               INTEGER NOT NULL DEFAULT 0,
+            comments            INTEGER NOT NULL DEFAULT 0,
+            subscribers_gained  INTEGER NOT NULL DEFAULT 0,
+            est_revenue_usd     REAL    NOT NULL DEFAULT 0,
+            cpm_usd             REAL    NOT NULL DEFAULT 0,
+            PRIMARY KEY (video_id, snapshot_date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_stats_video ON video_stats(video_id);",
+    )
+    .context("creating video_stats table")?;
+    Ok(())
+}
+
+// ============================================================
+// production_plan — selector output, per cycle
+// ============================================================
+
+fn create_production_plan(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS production_plan (
+            run_date  TEXT NOT NULL,   -- ISO YYYY-MM-DD
+            niche     TEXT NOT NULL,
+            format    TEXT NOT NULL,
+            quota     INTEGER NOT NULL,
+            reason    TEXT NOT NULL,
+            PRIMARY KEY (run_date, niche, format)
+        );",
+    )
+    .context("creating production_plan table")?;
+    Ok(())
+}
+
+// ============================================================
 // Additive migrations
 // ============================================================
 
@@ -180,6 +270,7 @@ fn migrate_additive(conn: &Connection) -> Result<()> {
     let additive = [
         // (table, column-with-type) — append new ones here over time.
         ("books", "issued_year INTEGER"),
+        ("books", "subjects TEXT NOT NULL DEFAULT ''"),
         ("script_frames", "thumb_path TEXT"),
         ("script_frames", "thumb_set INTEGER NOT NULL DEFAULT 0"),
         ("pipeline_state", "last_error TEXT"),
