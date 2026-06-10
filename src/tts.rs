@@ -133,8 +133,15 @@ fn estimate_secs(text: &str) -> f32 {
 
 /// Stage entry point: synthesize this book's hook line to audio and record the
 /// path + measured duration on its script_frames row. Idempotent — an existing
-/// non-empty audio file short-circuits before any network call.
-pub async fn run_one(conn: &Connection, cfg: &TtsConfig, book_id: i64) -> Result<()> {
+/// non-empty audio file short-circuits before any network call. The client +
+/// throttle are shared across the batch by the runner.
+pub async fn run_one(
+    conn: &Connection,
+    cfg: &TtsConfig,
+    client: &reqwest::Client,
+    throttle: &Throttle,
+    book_id: i64,
+) -> Result<()> {
     let row: Option<(Option<String>, Option<String>)> = conn
         .query_row(
             "SELECT hook_text, audio_path FROM script_frames WHERE book_id = ?1",
@@ -160,9 +167,7 @@ pub async fn run_one(conn: &Connection, cfg: &TtsConfig, book_id: i64) -> Result
         }
     }
 
-    let client = reqwest::Client::new();
-    let throttle = Throttle::from_default();
-    let out = synthesize(&client, &throttle, cfg, &hook_text).await?;
+    let out = synthesize(client, throttle, cfg, &hook_text).await?;
 
     let secs = crate::assemble::probe_duration(&out.path)
         .await

@@ -218,6 +218,8 @@ pub async fn run_one(
     conn: &Connection,
     auth_cfg: &AuthConfig,
     cfg: &UploadConfig,
+    client: &reqwest::Client,
+    throttle: &Throttle,
     book_id: i64,
 ) -> Result<()> {
     if crate::state::existing_youtube_id(conn, book_id)?.is_some() {
@@ -264,8 +266,6 @@ pub async fn run_one(
         &auth_cfg.refresh_token,
     )
     .context("building OAuthConfig for upload")?;
-    let client = reqwest::Client::new();
-    let throttle = Throttle::from_default();
 
     let job = UploadJob {
         video_path: Path::new(&video_path),
@@ -273,7 +273,7 @@ pub async fn run_one(
         description: &description,
         tags: &tags,
     };
-    let youtube_id = upload_video(&client, &throttle, &oauth, cfg, &job).await?;
+    let youtube_id = upload_video(client, throttle, &oauth, cfg, &job).await?;
 
     conn.execute(
         "UPDATE script_frames SET youtube_id = ?1 WHERE book_id = ?2",

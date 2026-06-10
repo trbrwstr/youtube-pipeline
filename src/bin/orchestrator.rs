@@ -22,10 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-use youtube_pipeline::{
-    assemble, config::AppConfig, db, hook, ingest, metadata, selector, state, thumbnail, tts,
-    upload,
-};
+use youtube_pipeline::{config::AppConfig, db, ingest, runner};
 
 // ============================================================
 // Stage enum — same ordering contract as pipeline.rs
@@ -245,10 +242,14 @@ async fn run_niche(cfg_path: &Path, plan: &[Stage], limit: usize) -> Result<(usi
     let cfg = AppConfig::load(cfg_path.to_str().context("non-utf8 config path")?)
         .with_context(|| format!("loading {}", cfg_path.display()))?;
 
-    let conn =
-        db::open_and_init(&cfg.db_path).with_context(|| format!("opening db {}", cfg.db_path))?;
-    db::set_channel_meta(&conn, &cfg.channel.niche, &cfg.channel.format)
-        .context("stamping channel_meta")?;
+    {
+        // Stamp this DB's niche/format once (used by analytics + selector),
+        // then let the runner manage its own per-worker connections.
+        let conn = db::open_and_init(&cfg.db_path)
+            .with_context(|| format!("opening db {}", cfg.db_path))?;
+        db::set_channel_meta(&conn, &cfg.channel.niche, &cfg.channel.format)
+            .context("stamping channel_meta")?;
+    }
 
     let niche = &cfg.channel.name;
     let (mut passed, mut failed) = (0usize, 0usize);
@@ -257,7 +258,7 @@ async fn run_niche(cfg_path: &Path, plan: &[Stage], limit: usize) -> Result<(usi
         let started = std::time::Instant::now();
         println!("[{niche}] -> stage: {}", stage.label());
 
-        match run_stage(&conn, stage, &cfg, limit).await {
+        match run_stage(stage, &cfg, limit).await {
             Ok(n) => {
                 println!(
                     "[{niche}]    {} ok :: {n} item(s) :: {:.1}s",
@@ -283,79 +284,32 @@ async fn run_niche(cfg_path: &Path, plan: &[Stage], limit: usize) -> Result<(usi
 }
 
 // ============================================================
-// run_stage — per-item loop with state stamping
-// (mirrors pipeline.rs so behavior is identical single- or multi-niche)
+// run_stage — delegates to the shared bounded-concurrency runner
+// (identical behavior single- or multi-niche)
 // ============================================================
 
-async fn run_stage(
-    conn: &rusqlite::Connection,
-    stage: Stage,
-    cfg: &AppConfig,
-    limit: usize,
-) -> Result<usize> {
+async fn run_stage(stage: Stage, cfg: &AppConfig, limit: usize) -> Result<usize> {
     // ingest is the one batch stage — there are no per-book ids before it runs.
     if stage == Stage::Ingest {
-        return ingest::run_batch(&cfg.db_path, &cfg.ingest, produce_limit(conn, cfg, limit))
+        let lim = runner::produce_limit(cfg, limit);
+        return ingest::run_batch(&cfg.db_path, &cfg.ingest, lim)
             .await
             .context("ingest stage");
     }
 
     // ingest + hook produce toward the selector's quota when one exists.
-    let effective_limit = if stage == Stage::Hook {
-        produce_limit(conn, cfg, limit)
+    let lim = if stage == Stage::Hook {
+        runner::produce_limit(cfg, limit)
     } else {
         limit
     };
-
-    let book_ids = state::eligible_for_stage(
-        conn,
+    runner::run_stage(
+        cfg,
         stage.label(),
         stage.depends_on().map(|d| d.label()),
-        cfg.max_attempts,
-        effective_limit,
+        lim,
     )
-    .with_context(|| format!("selecting eligible items for {}", stage.label()))?;
-
-    if book_ids.is_empty() {
-        return Ok(0);
-    }
-
-    let mut processed = 0usize;
-
-    for book_id in book_ids {
-        state::mark_running(conn, book_id, stage.label())?;
-
-        match run_one(stage, conn, cfg, book_id).await {
-            Ok(()) => {
-                state::mark_done(conn, book_id, stage.label())?;
-                processed += 1;
-            }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                eprintln!("    book {book_id} :: {} failed: {msg}", stage.label());
-                state::mark_failed(conn, book_id, stage.label(), &msg, cfg.max_attempts)?;
-            }
-        }
-    }
-
-    Ok(processed)
-}
-
-async fn run_one(
-    stage: Stage,
-    conn: &rusqlite::Connection,
-    cfg: &AppConfig,
-    book_id: i64,
-) -> Result<()> {
-    match stage {
-        Stage::Ingest => unreachable!("ingest is handled as a batch in run_stage"),
-        Stage::Hook => hook::run_one(conn, &cfg.hook, book_id).await,
-        Stage::Tts => tts::run_one(conn, &cfg.tts, book_id).await,
-        Stage::Assemble => assemble::run_one(conn, &cfg.assemble, book_id).await,
-        Stage::Metadata => metadata::run_one(conn, &cfg.metadata, book_id).await,
-        Stage::Thumbnail => thumbnail::run_one(conn, &cfg.auth, &cfg.thumbnail, book_id).await,
-        Stage::Upload => upload::run_one(conn, &cfg.auth, &cfg.upload, book_id).await,
-    }
+    .await
 }
 
 // ============================================================
@@ -393,14 +347,4 @@ fn discover_configs(args: &Args) -> Result<Vec<PathBuf>> {
 
     configs.sort();
     Ok(configs)
-}
-
-/// Resolve the per-stage produce limit: the selector's quota for this niche
-/// when a plan exists, capped by the CLI ceiling; otherwise the ceiling itself.
-fn produce_limit(conn: &rusqlite::Connection, cfg: &AppConfig, ceiling: usize) -> usize {
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    match selector::quota_for(conn, &today, &cfg.channel.niche, &cfg.channel.format) {
-        Ok(Some(q)) if q > 0 => (q as usize).min(ceiling),
-        _ => ceiling,
-    }
 }

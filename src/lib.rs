@@ -41,6 +41,9 @@ pub mod upload; // resumable video upload, writes youtube_id back
 pub mod analytics; // per-video stats -> video_stats time series
 pub mod selector; // revenue-weighted quota allocation -> production_plan
 
+// --- shared bounded-concurrency stage runner used by both binaries ---
+pub mod runner;
+
 // ============================================================
 // Re-exports — the crate's public surface
 // ============================================================

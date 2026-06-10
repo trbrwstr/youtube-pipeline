@@ -213,23 +213,34 @@ pub fn eligible_for_stage(
 ) -> Result<Vec<i64>> {
     let effective_dep = depends_on.filter(|d| *d != "ingest");
 
+    // The `NOT EXISTS` guard keeps steady-state seeding cheap: once a book has
+    // a row for this stage it's skipped, so each run only inserts genuinely-new
+    // candidates instead of re-attempting an INSERT for every book every time.
     match effective_dep {
         Some(dep) => {
             conn.execute(
-                "INSERT OR IGNORE INTO pipeline_state (stage, book_id, status)
+                "INSERT INTO pipeline_state (stage, book_id, status)
                  SELECT ?1, ps.book_id, 'pending'
                    FROM pipeline_state ps
-                  WHERE ps.stage = ?2 AND ps.status = 'done'",
+                  WHERE ps.stage = ?2 AND ps.status = 'done'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM pipeline_state x
+                         WHERE x.stage = ?1 AND x.book_id = ps.book_id
+                    )",
                 params![stage, dep],
             )
             .with_context(|| format!("seeding {stage} from {dep}"))?;
         }
         None => {
             conn.execute(
-                "INSERT OR IGNORE INTO pipeline_state (stage, book_id, status)
+                "INSERT INTO pipeline_state (stage, book_id, status)
                  SELECT ?1, b.id, 'pending'
                    FROM books b
-                  WHERE b.body IS NOT NULL AND length(trim(b.body)) > 0",
+                  WHERE b.body IS NOT NULL AND length(trim(b.body)) > 0
+                    AND NOT EXISTS (
+                        SELECT 1 FROM pipeline_state x
+                         WHERE x.stage = ?1 AND x.book_id = b.id
+                    )",
                 params![stage],
             )
             .with_context(|| format!("seeding {stage} from books"))?;

@@ -133,7 +133,7 @@ impl CostGuard {
 
     /// Reserve `estimate` tokens. Returns false if it would breach the budget,
     /// in which case the caller should use the deterministic builder instead.
-    fn try_charge(&self, estimate: u64) -> bool {
+    pub fn try_charge(&self, estimate: u64) -> bool {
         let prev = self.spent.fetch_add(estimate, Ordering::SeqCst);
         if prev + estimate > self.budget {
             // roll back the over-charge so the reported total stays honest
@@ -154,7 +154,7 @@ impl CostGuard {
 }
 
 /// Rough token estimate from char count (~4 chars/token for English prose).
-fn estimate_tokens(text: &str) -> u64 {
+pub(crate) fn estimate_tokens(text: &str) -> u64 {
     ((text.chars().count() as f64) / 4.0).ceil() as u64
 }
 
@@ -458,6 +458,7 @@ async fn try_llm_hook(
             cfg.api_base.trim_end_matches('/')
         ))
         .bearer_auth(&cfg.api_key)
+        .timeout(Duration::from_secs(cfg.timeout_secs))
         .json(&req)
         .send()
         .await
@@ -582,8 +583,15 @@ fn upsert_hook(conn: &Connection, book_id: i64, hook_text: &str) -> Result<()> {
 
 /// Stage entry point: generate (LLM with deterministic fallback) and store the
 /// hook for one book. Idempotent — a book that already has a non-empty
-/// `hook_text` is a no-op so re-runs don't re-spend on the LLM.
-pub async fn run_one(conn: &Connection, cfg: &HookConfig, book_id: i64) -> Result<()> {
+/// `hook_text` is a no-op so re-runs don't re-spend on the LLM. The HTTP client
+/// is shared across the batch by the runner (connection-pool reuse).
+pub async fn run_one(
+    conn: &Connection,
+    cfg: &HookConfig,
+    client: &reqwest::Client,
+    cost: &CostGuard,
+    book_id: i64,
+) -> Result<()> {
     let existing: Option<String> = conn
         .query_row(
             "SELECT hook_text FROM script_frames WHERE book_id = ?1",
@@ -601,14 +609,9 @@ pub async fn run_one(conn: &Connection, cfg: &HookConfig, book_id: i64) -> Resul
         anyhow::bail!("book {book_id} has no body to hook");
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(cfg.timeout_secs))
-        .build()
-        .context("building hook http client")?;
-    let cost = CostGuard::new(cfg.max_tokens_budget, cfg.usd_per_1k_tokens);
-
     // build_hook_llm never errors — it falls back to the deterministic builder.
-    let frame = build_hook_llm(&book, cfg, &client, &cost).await;
+    // `cost` is the batch-wide budget shared by every worker in this run.
+    let frame = build_hook_llm(&book, cfg, client, cost).await;
     upsert_hook(conn, book_id, &frame.voice_line)?;
     Ok(())
 }

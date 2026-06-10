@@ -20,6 +20,12 @@ pub struct MetadataConfig {
     pub max_tags: usize,
     #[serde(default)]
     pub channel_blurb: String,
+    /// Batch-wide LLM token budget; once exceeded the stage falls back to the
+    /// free deterministic builder (parity with the hook stage).
+    #[serde(default = "default_max_tokens_budget")]
+    pub max_tokens_budget: u64,
+    #[serde(default = "default_usd_per_1k_tokens")]
+    pub usd_per_1k_tokens: f64,
 }
 
 fn default_timeout() -> u64 {
@@ -36,6 +42,12 @@ fn default_desc_chars() -> usize {
 }
 fn default_max_tags() -> usize {
     15
+}
+fn default_max_tokens_budget() -> u64 {
+    300_000
+}
+fn default_usd_per_1k_tokens() -> f64 {
+    0.0006
 }
 
 impl MetadataConfig {
@@ -178,8 +190,12 @@ pub fn build_metadata_deterministic(cfg: &MetadataConfig, book: &BookMeta) -> Vi
     }
 }
 
-pub async fn build_metadata_llm(cfg: &MetadataConfig, book: &BookMeta) -> VideoMetadata {
-    match try_llm(cfg, book).await {
+pub async fn build_metadata_llm(
+    cfg: &MetadataConfig,
+    client: &reqwest::Client,
+    book: &BookMeta,
+) -> VideoMetadata {
+    match try_llm(cfg, client, book).await {
         Ok(meta) => meta,
         Err(e) => {
             eprintln!(
@@ -191,11 +207,11 @@ pub async fn build_metadata_llm(cfg: &MetadataConfig, book: &BookMeta) -> VideoM
     }
 }
 
-async fn try_llm(cfg: &MetadataConfig, book: &BookMeta) -> Result<VideoMetadata> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(cfg.timeout_secs))
-        .build()?;
-
+async fn try_llm(
+    cfg: &MetadataConfig,
+    client: &reqwest::Client,
+    book: &BookMeta,
+) -> Result<VideoMetadata> {
     let system = "You write YouTube metadata for a faceless channel about \
 public-domain classic books. Output strict JSON with keys: title (string, \
 punchy, curiosity-driven, no clickbait lies), description (string, 2-4 short \
@@ -244,6 +260,7 @@ Write the metadata. The title may reuse or sharpen the hook. Keep title under {}
             cfg.api_base.trim_end_matches('/')
         ))
         .bearer_auth(&cfg.api_key)
+        .timeout(Duration::from_secs(cfg.timeout_secs))
         .json(&req)
         .send()
         .await
@@ -332,22 +349,39 @@ fn dedup_truncate_tags(tags: &mut Vec<String>, max_tags: usize) {
     *tags = kept;
 }
 
-/// Single-item entry point used by the orchestrator's run_one dispatch.
-pub async fn run_one(conn: &Connection, cfg: &MetadataConfig, book_id: i64) -> Result<()> {
+/// Single-item entry point used by the runner's dispatch. The HTTP client and
+/// the batch-wide `cost` budget are shared across every worker in the run; once
+/// the budget is exhausted this falls back to the free deterministic builder.
+pub async fn run_one(
+    conn: &Connection,
+    cfg: &MetadataConfig,
+    client: &reqwest::Client,
+    cost: &crate::hook::CostGuard,
+    book_id: i64,
+) -> Result<()> {
     let book = fetch_one(conn, book_id)?;
-    let meta = build_metadata_llm(cfg, &book).await;
+
+    // Pre-flight token estimate (chars/4 heuristic + completion headroom).
+    let est = crate::hook::estimate_tokens(&book.title)
+        + crate::hook::estimate_tokens(&book.hook_text)
+        + crate::hook::estimate_tokens(&book.subjects)
+        + 256;
+
+    let meta = if cost.try_charge(est) {
+        build_metadata_llm(cfg, client, &book).await
+    } else {
+        eprintln!(
+            "[metadata] budget reached ({} tok); deterministic for book {book_id}",
+            cost.spent_tokens()
+        );
+        build_metadata_deterministic(cfg, &book)
+    };
+
     store_metadata(conn, book_id, &meta)?;
     Ok(())
 }
 
 fn fetch_one(db: &Connection, book_id: i64) -> Result<BookMeta> {
-    db.execute_batch("ALTER TABLE script_frames ADD COLUMN yt_title TEXT;")
-        .ok();
-    db.execute_batch("ALTER TABLE script_frames ADD COLUMN yt_description TEXT;")
-        .ok();
-    db.execute_batch("ALTER TABLE script_frames ADD COLUMN yt_tags TEXT;")
-        .ok();
-
     db.query_row(
         "SELECT sf.book_id, b.title, b.author, sf.hook_text, COALESCE(b.subjects, '') \
          FROM script_frames sf JOIN books b ON b.id = sf.book_id WHERE sf.book_id = ?1",
