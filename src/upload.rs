@@ -1,11 +1,16 @@
 // src/upload.rs
 use crate::auth::{self, OAuthConfig};
+use crate::config::AuthConfig;
 use crate::throttle::Throttle;
 use anyhow::{anyhow, Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
+
+/// Shared pacing key with the thumbnail stage (same googleapis quota pool).
+const HOST: &str = "googleapis.com";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UploadConfig {
@@ -188,11 +193,75 @@ pub async fn upload_video(
         return Err(anyhow!("refusing to upload empty file {}", job.video_path.display()));
     }
 
-    let _guard = throttle.acquire().await;
+    let _guard = throttle.acquire(HOST).await;
     let access_token = auth::fetch_access_token(client, oauth)
         .await
         .context("fetching access token for upload")?;
 
     let session_url = initiate_session(client, &access_token, cfg, job, file_len).await?;
     push_chunks(client, &session_url, job.video_path, cfg, file_len).await
+}
+
+/// Stage entry point: publish this book's rendered video, writing the returned
+/// youtube_id back to its frame. Idempotent — a frame that already carries a
+/// youtube_id is treated as published and skipped.
+pub async fn run_one(
+    conn: &Connection,
+    auth_cfg: &AuthConfig,
+    cfg: &UploadConfig,
+    book_id: i64,
+) -> Result<()> {
+    if crate::state::existing_youtube_id(conn, book_id)?.is_some() {
+        return Ok(());
+    }
+
+    let row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT output_path, yt_title, yt_description, yt_tags \
+             FROM script_frames WHERE book_id = ?1",
+            params![book_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .with_context(|| format!("loading frame for upload book {book_id}"))?;
+
+    let (output_path, yt_title, yt_description, yt_tags) = match row {
+        Some(t) => t,
+        None => anyhow::bail!("book {book_id} has no script frame for upload"),
+    };
+
+    let video_path = output_path
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| anyhow!("book {book_id} has no rendered video to upload"))?;
+
+    let title = yt_title.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| format!("book {book_id}"));
+    let description = yt_description.unwrap_or_default();
+    let tags: Vec<String> = yt_tags
+        .as_deref()
+        .map(|b| b.lines().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default();
+
+    let oauth = OAuthConfig::from_values(
+        &auth_cfg.client_id,
+        &auth_cfg.client_secret,
+        &auth_cfg.refresh_token,
+    )
+    .context("building OAuthConfig for upload")?;
+    let client = reqwest::Client::new();
+    let throttle = Throttle::from_default();
+
+    let job = UploadJob {
+        video_path: Path::new(&video_path),
+        title: &title,
+        description: &description,
+        tags: &tags,
+    };
+    let youtube_id = upload_video(&client, &throttle, &oauth, cfg, &job).await?;
+
+    conn.execute(
+        "UPDATE script_frames SET youtube_id = ?1 WHERE book_id = ?2",
+        params![youtube_id, book_id],
+    )
+    .with_context(|| format!("recording youtube_id for book {book_id}"))?;
+    Ok(())
 }

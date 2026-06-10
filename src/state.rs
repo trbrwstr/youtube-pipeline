@@ -6,7 +6,8 @@
 pub fn existing_youtube_id(conn: &rusqlite::Connection, book_id: i64) -> Result<Option<String>> {
     let id: Option<String> = conn
         .query_row(
-            "SELECT youtube_id FROM books WHERE id = ?1 AND youtube_id IS NOT NULL",
+            "SELECT youtube_id FROM script_frames \
+             WHERE book_id = ?1 AND youtube_id IS NOT NULL AND youtube_id <> ''",
             [book_id],
             |row| row.get(0),
         )
@@ -27,7 +28,7 @@ pub fn mark_done_with_video(
 ) -> Result<()> {
     let tx = conn.transaction().context("opening upload-commit tx")?;
     tx.execute(
-        "UPDATE books SET youtube_id = ?1 WHERE id = ?2",
+        "UPDATE script_frames SET youtube_id = ?1 WHERE book_id = ?2",
         rusqlite::params![youtube_id, book_id],
     )
     .context("recording youtube_id")?;
@@ -45,7 +46,7 @@ pub fn mark_done_with_video(
 // src/state.rs (additions)
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::BTreeMap;
 
 /// Any row stuck in `running` longer than `stale_secs` is assumed to be from a
@@ -160,4 +161,221 @@ pub fn dead_letters(conn: &Connection, stage: Option<&str>, limit: usize) -> Res
             .collect::<rusqlite::Result<_>>()?
     };
     Ok(rows)
+}
+
+// ============================================================
+// Unified per-item state machine
+// ============================================================
+//
+// Both binaries drive every non-ingest stage through this trio:
+//   eligible_for_stage -> [mark_running -> run_one -> mark_done|mark_failed]*
+// pipeline_state is seeded lazily: a stage's pending rows appear once its
+// upstream dependency is `done` (or, for the first real stage, once a book
+// with a body exists). Each run_one carries its own idempotency guard, so a
+// re-run is always safe.
+
+/// One status label. Re-exported at the crate root for callers that want the
+/// vocabulary without the SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageStatus {
+    Pending,
+    Running,
+    Done,
+    Failed,
+    Dead,
+}
+
+/// Per-stage tally for the ops `status` grid.
+#[derive(Debug, Default, Clone)]
+pub struct StageCounts {
+    pub pending: i64,
+    pub running: i64,
+    pub done: i64,
+    pub failed: i64,
+    pub dead: i64,
+}
+
+/// Seed missing `pending` rows for `stage`, then return up to `limit` book_ids
+/// whose `stage` row is workable (pending or failed, under the attempt ceiling).
+///
+/// `depends_on` is the upstream stage that must be `done` first. The synthetic
+/// "ingest" dependency is treated as "none" — ingest is a batch stage with no
+/// per-book state — so the first real stage (`hook`) seeds straight off any
+/// book that has a body.
+pub fn eligible_for_stage(
+    conn: &Connection,
+    stage: &str,
+    depends_on: Option<&str>,
+    max_attempts: i64,
+    limit: usize,
+) -> Result<Vec<i64>> {
+    let effective_dep = depends_on.filter(|d| *d != "ingest");
+
+    match effective_dep {
+        Some(dep) => {
+            conn.execute(
+                "INSERT OR IGNORE INTO pipeline_state (stage, book_id, status)
+                 SELECT ?1, ps.book_id, 'pending'
+                   FROM pipeline_state ps
+                  WHERE ps.stage = ?2 AND ps.status = 'done'",
+                params![stage, dep],
+            )
+            .with_context(|| format!("seeding {stage} from {dep}"))?;
+        }
+        None => {
+            conn.execute(
+                "INSERT OR IGNORE INTO pipeline_state (stage, book_id, status)
+                 SELECT ?1, b.id, 'pending'
+                   FROM books b
+                  WHERE b.body IS NOT NULL AND length(trim(b.body)) > 0",
+                params![stage],
+            )
+            .with_context(|| format!("seeding {stage} from books"))?;
+        }
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT book_id FROM pipeline_state
+          WHERE stage = ?1 AND status IN ('pending','failed') AND attempts < ?2
+          ORDER BY book_id
+          LIMIT ?3",
+    )?;
+    let ids: Vec<i64> = stmt
+        .query_map(params![stage, max_attempts, limit as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ids)
+}
+
+/// Claim a job: flip its row to `running` (creating it if somehow absent).
+pub fn mark_running(conn: &Connection, book_id: i64, stage: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pipeline_state (stage, book_id, status, updated_at)
+         VALUES (?2, ?1, 'running', strftime('%s','now'))
+         ON CONFLICT(stage, book_id) DO UPDATE
+           SET status = 'running', updated_at = strftime('%s','now')",
+        params![book_id, stage],
+    )
+    .with_context(|| format!("mark_running {stage} book {book_id}"))?;
+    Ok(())
+}
+
+/// Terminal success: `done`, clear the error, bump the attempt count.
+pub fn mark_done(conn: &Connection, book_id: i64, stage: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pipeline_state
+            SET status = 'done', attempts = attempts + 1, last_error = NULL,
+                updated_at = strftime('%s','now')
+          WHERE stage = ?2 AND book_id = ?1",
+        params![book_id, stage],
+    )
+    .with_context(|| format!("mark_done {stage} book {book_id}"))?;
+    Ok(())
+}
+
+/// Terminal failure: `failed` while under the attempt ceiling, `dead` once it's
+/// burned through them. Records the error for the dead-letter view.
+pub fn mark_failed(
+    conn: &Connection,
+    book_id: i64,
+    stage: &str,
+    err: &str,
+    max_attempts: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pipeline_state
+            SET status = CASE WHEN attempts + 1 >= ?3 THEN 'dead' ELSE 'failed' END,
+                attempts = attempts + 1,
+                last_error = ?4,
+                updated_at = strftime('%s','now')
+          WHERE stage = ?2 AND book_id = ?1",
+        params![book_id, stage, max_attempts, err],
+    )
+    .with_context(|| format!("mark_failed {stage} book {book_id}"))?;
+    Ok(())
+}
+
+/// Counts by status for a single stage (the ops `status` grid row).
+pub fn stage_counts_for(conn: &Connection, stage: &str) -> Result<StageCounts> {
+    let mut stmt = conn.prepare(
+        "SELECT status, COUNT(*) FROM pipeline_state WHERE stage = ?1 GROUP BY status",
+    )?;
+    let rows = stmt.query_map(params![stage], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
+
+    let mut c = StageCounts::default();
+    for row in rows {
+        let (status, n) = row?;
+        match status.as_str() {
+            "pending" => c.pending = n,
+            "running" => c.running = n,
+            "done" => c.done = n,
+            "failed" => c.failed = n,
+            "dead" => c.dead = n,
+            _ => {}
+        }
+    }
+    Ok(c)
+}
+
+#[cfg(test)]
+mod machine_tests {
+    use super::*;
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init(&conn).unwrap();
+        conn
+    }
+
+    fn add_book(conn: &Connection, id: i64, body: &str) {
+        conn.execute(
+            "INSERT INTO books (gutenberg_id, title, body) VALUES (?1, ?2, ?3)",
+            params![id, format!("Book {id}"), body],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn hook_seeds_only_books_with_body() {
+        let conn = db();
+        add_book(&conn, 1, "a real body long enough");
+        add_book(&conn, 2, ""); // empty body — must not be seeded
+        let ids = eligible_for_stage(&conn, "hook", Some("ingest"), 3, 10).unwrap();
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[test]
+    fn downstream_waits_for_dependency_done() {
+        let conn = db();
+        add_book(&conn, 1, "body");
+        // hook not done yet -> tts has nothing eligible
+        let ids = eligible_for_stage(&conn, "tts", Some("hook"), 3, 10).unwrap();
+        assert!(ids.is_empty());
+
+        // run hook to done, then tts becomes eligible
+        let hook_ids = eligible_for_stage(&conn, "hook", Some("ingest"), 3, 10).unwrap();
+        for id in hook_ids {
+            mark_running(&conn, id, "hook").unwrap();
+            mark_done(&conn, id, "hook").unwrap();
+        }
+        let ids = eligible_for_stage(&conn, "tts", Some("hook"), 3, 10).unwrap();
+        assert_eq!(ids, vec![1]);
+    }
+
+    #[test]
+    fn failed_becomes_dead_at_ceiling() {
+        let conn = db();
+        add_book(&conn, 1, "body");
+        let _ = eligible_for_stage(&conn, "hook", None, 2, 10).unwrap();
+        mark_running(&conn, 1, "hook").unwrap();
+        mark_failed(&conn, 1, "hook", "boom", 2).unwrap(); // attempts 1 -> failed
+        mark_failed(&conn, 1, "hook", "boom", 2).unwrap(); // attempts 2 -> dead
+        let c = stage_counts_for(&conn, "hook").unwrap();
+        assert_eq!(c.dead, 1);
+        assert_eq!(c.failed, 0);
+        // dead rows are not re-offered
+        let ids = eligible_for_stage(&conn, "hook", None, 2, 10).unwrap();
+        assert!(ids.is_empty());
+    }
 }

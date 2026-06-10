@@ -1,9 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection};
 use serde::Deserialize;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetadataConfig {

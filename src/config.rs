@@ -16,7 +16,7 @@
 //   anyhow = "1"
 //   regex  = "1"
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 use std::time::Duration;
@@ -41,6 +41,10 @@ pub struct AppConfig {
     /// Path to the SQLite file. Required, non-empty.
     pub db_path: String,
 
+    /// How many times a per-book stage may fail before it's dead-lettered.
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: i64,
+
     pub channel: ChannelConfig,
     pub throttle: ThrottleConfig,
     pub auth: AuthConfig,
@@ -52,6 +56,19 @@ pub struct AppConfig {
     pub metadata: MetadataConfig,
     pub thumbnail: ThumbnailConfig,
     pub upload: UploadConfig,
+    pub selector: SelectorConfig,
+}
+
+fn default_max_attempts() -> i64 { 3 }
+
+/// `[selector]` — the explore/exploit budget allocator's tuning knobs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SelectorConfig {
+    pub total_budget: i64,
+    pub min_per_niche: i64,
+    pub max_per_niche: i64,
+    pub min_sample: i64,
+    pub exploit_weight: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

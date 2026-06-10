@@ -1,10 +1,14 @@
 // src/tts.rs
 use crate::throttle::Throttle;
 use anyhow::{anyhow, Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Stable pacing key for the TTS endpoint (one floor across all synth calls).
+const TTS_HOST: &str = "tts-endpoint";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TtsConfig {
@@ -71,7 +75,7 @@ pub async fn synthesize(
         }
     }
 
-    let _guard = throttle.acquire().await;
+    let _guard = throttle.acquire(TTS_HOST).await;
 
     let req = TtsRequest {
         model: &cfg.model,
@@ -110,4 +114,55 @@ pub async fn synthesize(
         .with_context(|| format!("promoting {} -> {}", tmp.display(), out_path.display()))?;
 
     Ok(TtsOutput { path: out_path, cached: false })
+}
+
+/// Rough fallback duration when ffprobe isn't available: ~2.5 words/sec.
+fn estimate_secs(text: &str) -> f32 {
+    let words = text.split_whitespace().count() as f32;
+    (words / 2.5).max(1.0)
+}
+
+/// Stage entry point: synthesize this book's hook line to audio and record the
+/// path + measured duration on its script_frames row. Idempotent — an existing
+/// non-empty audio file short-circuits before any network call.
+pub async fn run_one(conn: &Connection, cfg: &TtsConfig, book_id: i64) -> Result<()> {
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT hook_text, audio_path FROM script_frames WHERE book_id = ?1",
+            params![book_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .with_context(|| format!("loading frame for tts book {book_id}"))?;
+
+    let (hook_text, existing_audio) = match row {
+        Some((Some(h), audio)) if !h.trim().is_empty() => (h, audio),
+        _ => anyhow::bail!("book {book_id} has no hook_text for tts"),
+    };
+
+    // Idempotency: a previously rendered, non-empty file means we're done.
+    if let Some(p) = existing_audio {
+        if !p.is_empty() {
+            if let Ok(meta) = tokio::fs::metadata(&p).await {
+                if meta.len() > 0 {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    let client = reqwest::Client::new();
+    let throttle = Throttle::from_default();
+    let out = synthesize(&client, &throttle, cfg, &hook_text).await?;
+
+    let secs = crate::assemble::probe_duration(&out.path)
+        .await
+        .unwrap_or_else(|_| estimate_secs(&hook_text));
+
+    conn.execute(
+        "UPDATE script_frames SET audio_path = ?1, audio_secs = ?2 WHERE book_id = ?3",
+        params![out.path.to_string_lossy(), secs, book_id],
+    )
+    .with_context(|| format!("recording audio for book {book_id}"))?;
+    Ok(())
 }

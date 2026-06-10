@@ -37,6 +37,10 @@ pub mod metadata; // yt_title / yt_description / yt_tags
 pub mod thumbnail; // thumbnail render + thumbnails.set upload
 pub mod upload; // resumable video upload, writes youtube_id back
 
+// --- feedback loop: measure performance, reallocate production ---
+pub mod analytics; // per-video stats -> video_stats time series
+pub mod selector; // revenue-weighted quota allocation -> production_plan
+
 // ============================================================
 // Re-exports — the crate's public surface
 // ============================================================
@@ -108,7 +112,7 @@ impl Book {
 /// The per-book production record — one row per book (`UNIQUE(book_id)`), the
 /// "one book, one video" contract. Every stage after `hook` reads its inputs
 /// from here and writes its outputs back: `hook` fills `hook_text`, `tts` fills
-/// `audio_path`, `assemble` fills `video_path`, `metadata` fills the `yt_*`
+/// `audio_path`, `assemble` fills `output_path`, `metadata` fills the `yt_*`
 /// columns, `upload` fills `youtube_id`. A fully-populated row is a published
 /// video; a partial row tells you exactly how far the chain got.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -124,7 +128,7 @@ pub struct ScriptFrame {
     pub audio_secs: Option<f32>,
 
     /// Final assembled vertical mp4 under data/video/. Written by `assemble`.
-    pub video_path: Option<String>,
+    pub output_path: Option<String>,
 
     // --- metadata stage outputs ---
     pub yt_title: Option<String>,

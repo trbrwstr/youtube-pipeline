@@ -1,0 +1,84 @@
+db_path = "./data/dead_authors.db"
+max_attempts = 3
+
+[channel]
+name   = "Dead Authors"
+niche  = "dead_authors"
+format = "short"
+
+[throttle]
+max_concurrency     = 4
+default_interval_ms = 200
+[throttle.host_intervals_ms]
+"gutenberg.org"         = 250
+"oauth2.googleapis.com" = 50
+"googleapis.com"        = 500
+
+[auth]
+client_id     = "${YT_CLIENT_ID}"
+client_secret = "${YT_CLIENT_SECRET}"
+refresh_token = "${YT_REFRESH_TOKEN}"
+
+[ingest]
+language        = "en"
+max_issued_year = 1928
+cache_dir       = "cache"
+fetch_text      = true
+
+[hook]
+api_base      = "https://api.openai.com/v1"
+api_key       = "${OPENAI_API_KEY}"
+model         = "gpt-4o-mini"
+wpm           = 150.0
+max_hook_secs = 8.0
+system_prompt = """
+You write hooks for a Dead Authors channel — short, punchy teasers of the lives \
+and last words of writers the world forgot. End on a cliffhanger. Never explain.
+"""
+timeout_secs  = 20
+concurrency   = 6
+
+[tts]
+api_base     = "https://api.openai.com/v1"
+api_key      = "${OPENAI_API_KEY}"
+model        = "tts-1"
+voice        = "echo"
+format       = "mp3"
+speed        = 1.05
+cache_dir    = "cache/audio"
+timeout_secs = 60
+
+[assemble]
+background_image = "assets/dead_authors_bg_1080x1920.png"
+out_dir          = "data/video_dead_authors"
+
+[metadata]
+api_base        = "https://api.openai.com/v1"
+api_key         = "${OPENAI_API_KEY}"
+model           = "gpt-4o-mini"
+timeout_secs    = 30
+max_concurrency = 3
+max_title_chars = 100
+max_desc_chars  = 5000
+max_tags        = 15
+channel_blurb   = """
+Dead Authors — the forgotten lives behind the public-domain canon.
+"""
+
+[thumbnail]
+max_retries          = 3
+request_timeout_secs = 60
+
+[upload]
+privacy_status = "unlisted"
+category_id    = "27"
+made_for_kids  = false
+chunk_bytes    = 8388608
+timeout_secs   = 120
+
+[selector]
+total_budget   = 100
+min_per_niche  = 5
+max_per_niche  = 60
+min_sample     = 10
+exploit_weight = 0.7
