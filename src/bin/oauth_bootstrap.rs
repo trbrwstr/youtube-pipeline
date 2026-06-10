@@ -76,7 +76,11 @@ async fn main() -> Result<()> {
         .await
         .context("exchanging code for tokens")?;
 
-    println!("Success! Add this to your environment:\n\n  export YT_REFRESH_TOKEN=\"{refresh}\"\n");
+    println!(
+        "Success! Export this token under THIS channel's variable — it must match\n\
+         the [auth].refresh_token var in that niche's config, e.g.:\n\n  \
+         export YT_REFRESH_TOKEN_<NICHE>=\"{refresh}\"\n"
+    );
     Ok(())
 }
 
