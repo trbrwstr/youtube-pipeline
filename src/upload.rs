@@ -202,6 +202,9 @@ pub async fn upload_video(
     push_chunks(client, &session_url, job.video_path, cfg, file_len).await
 }
 
+/// (output_path, yt_title, yt_description, yt_tags) as stored on a frame.
+type UploadRow = (Option<String>, Option<String>, Option<String>, Option<String>);
+
 /// Stage entry point: publish this book's rendered video, writing the returned
 /// youtube_id back to its frame. Idempotent — a frame that already carries a
 /// youtube_id is treated as published and skipped.
@@ -215,7 +218,7 @@ pub async fn run_one(
         return Ok(());
     }
 
-    let row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = conn
+    let row: Option<UploadRow> = conn
         .query_row(
             "SELECT output_path, yt_title, yt_description, yt_tags \
              FROM script_frames WHERE book_id = ?1",

@@ -129,11 +129,14 @@ async fn extract_thumb(video: &Path, out: &Path) -> Result<PathBuf> {
     }
 }
 
+/// (hook_text, audio_path, audio_secs, output_path) as stored on a frame.
+type AssembleRow = (Option<String>, Option<String>, Option<f32>, Option<String>);
+
 /// Stage entry point: render this book's narration + caption into a vertical
 /// mp4 and stamp `output_path` (and a best-effort `thumb_path`). Idempotent —
 /// an existing rendered file short-circuits.
 pub async fn run_one(conn: &Connection, cfg: &AssembleConfig, book_id: i64) -> Result<()> {
-    let row: Option<(Option<String>, Option<String>, Option<f32>, Option<String>)> = conn
+    let row: Option<AssembleRow> = conn
         .query_row(
             "SELECT hook_text, audio_path, audio_secs, output_path \
              FROM script_frames WHERE book_id = ?1",
