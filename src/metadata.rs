@@ -270,7 +270,7 @@ fn truncate_clean(s: &str, max_chars: usize) -> String {
         out.push_str(word);
         count += wlen;
     }
-    out.trim_end_matches(|c: char| c == ',' || c == '-' || c == '—')
+    out.trim_end_matches([',', '-', '—'])
         .trim()
         .to_string()
 }
