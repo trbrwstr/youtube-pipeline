@@ -155,8 +155,12 @@ the matches you pick — this bypasses the year filter, so you can grab any titl
 pipeline search "frankenstein" --config config/forgotten_classics.toml
 pipeline search "austen" --limit 100
 
-# Ingest the ones you want by Gutenberg id (fetches text + stores them).
+# Ingest the ones you want — by Gutenberg id, by exact title, or both:
 pipeline add --config config/forgotten_classics.toml --ids 84,1342,98
+pipeline add --config config/forgotten_classics.toml --titles "Frankenstein;Dracula"
+
+# Or ingest every match from a search in one shot:
+pipeline search "h. g. wells" --ingest --limit 25
 
 # Then produce as usual — the curated books flow through the same chain.
 pipeline run --config config/forgotten_classics.toml --stages hook,tts,assemble,metadata
@@ -164,8 +168,11 @@ pipeline run --config config/forgotten_classics.toml --stages hook,tts,assemble,
 
 Notes:
 - The first `search`/`add` downloads the ~80MB catalog (then it's ETag-cached).
-- `add` skips ids already in the library and reports any id not found.
-- Curated books ignore `max_issued_year`/`language` — you asked for them by id.
+- `search --ingest` ingests every listed match (capped by `--limit`).
+- `add --titles` matches the **exact** title (case-insensitive); use `search`
+  first if you're unsure of the precise title. `--ids` and `--titles` combine.
+- `add` skips books already in the library and reports any id/title not found.
+- Curated books ignore `max_issued_year`/`language` — you asked for them.
 
 ---
 

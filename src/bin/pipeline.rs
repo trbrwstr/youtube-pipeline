@@ -181,6 +181,10 @@ struct SearchArgs {
     /// Max matches to list.
     #[arg(short, long, default_value_t = 50)]
     limit: usize,
+
+    /// Ingest every listed match (capped by --limit) instead of just listing.
+    #[arg(long, default_value_t = false)]
+    ingest: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -189,8 +193,12 @@ struct AddArgs {
     config: String,
 
     /// Gutenberg ids to ingest, e.g. --ids 1342,98,84
-    #[arg(long, value_delimiter = ',', required = true)]
+    #[arg(long, value_delimiter = ',')]
     ids: Vec<i64>,
+
+    /// Exact titles to ingest (case-insensitive), e.g. --titles "Frankenstein;Dracula"
+    #[arg(long, value_delimiter = ';')]
+    titles: Vec<String>,
 }
 
 #[tokio::main]
@@ -442,20 +450,46 @@ async fn cmd_search(args: SearchArgs) -> Result<()> {
             if in_lib { "  [in library]" } else { "" },
         );
     }
-    println!(
-        "\nIngest the ones you want:  pipeline add --config {} --ids <id,id,...>",
-        args.config
-    );
+    if args.ingest {
+        let ids: Vec<i64> = matches.iter().map(|m| m.gutenberg_id).collect();
+        let n = ingest::ingest_ids(&cfg.db_path, &cfg.ingest, &ids)
+            .await
+            .context("ingesting search matches")?;
+        println!(
+            "\ningested {n} of {} match(es) into '{}'.",
+            ids.len(),
+            cfg.channel.name
+        );
+    } else {
+        println!(
+            "\nIngest these:  pipeline add --config {} --ids <id,id,...>   \
+             (or re-run search with --ingest)",
+            args.config
+        );
+    }
     Ok(())
 }
 
 async fn cmd_add(args: AddArgs) -> Result<()> {
+    if args.ids.is_empty() && args.titles.is_empty() {
+        anyhow::bail!("pass --ids and/or --titles");
+    }
     let cfg = boot(&args.config)?;
-    let n = ingest::ingest_ids(&cfg.db_path, &cfg.ingest, &args.ids)
-        .await
-        .context("ingesting requested ids")?;
+
+    let mut added = 0usize;
+    if !args.ids.is_empty() {
+        added += ingest::ingest_ids(&cfg.db_path, &cfg.ingest, &args.ids)
+            .await
+            .context("ingesting requested ids")?;
+    }
+    if !args.titles.is_empty() {
+        added += ingest::ingest_titles(&cfg.db_path, &cfg.ingest, &args.titles)
+            .await
+            .context("ingesting requested titles")?;
+    }
+
     println!(
-        "added {n} book(s) to '{}'. Produce them with: \
+        "added {added} book(s) to '{}'. Produce them with: \
          pipeline run --config {} --stages hook,tts,assemble,metadata",
         cfg.channel.name, args.config
     );

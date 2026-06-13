@@ -490,18 +490,42 @@ pub async fn ingest_ids(db_path: &str, cfg: &IngestConfig, ids: &[i64]) -> Resul
     if ids.is_empty() {
         return Ok(0);
     }
-    let throttle = Throttle::from_default();
+    let client = catalog_client()?;
+    let csv_bytes = fetch_catalog(&client, cfg)
+        .await
+        .context("fetching pg_catalog.csv.gz")?;
+    store_ids(db_path, &client, &csv_bytes, ids).await
+}
+
+/// Ingest books by exact (case-insensitive) title. Resolves each title to its
+/// catalog id(s), then stores like `ingest_ids`. Titles with no exact match are
+/// reported and skipped.
+pub async fn ingest_titles(db_path: &str, cfg: &IngestConfig, titles: &[String]) -> Result<usize> {
+    if titles.is_empty() {
+        return Ok(0);
+    }
     let client = catalog_client()?;
     let csv_bytes = fetch_catalog(&client, cfg)
         .await
         .context("fetching pg_catalog.csv.gz")?;
 
-    let wanted: std::collections::HashSet<i64> = ids.iter().copied().collect();
-    let mut found: std::collections::HashMap<i64, Book> = std::collections::HashMap::new();
+    let ids = ids_for_titles(&csv_bytes, titles);
+    if ids.is_empty() {
+        eprintln!("ingest: no exact title matches for {titles:?}");
+        return Ok(0);
+    }
+    store_ids(db_path, &client, &csv_bytes, &ids).await
+}
 
+/// Collect catalog rows for the wanted ids into Books (no text yet). Pure.
+fn collect_books(
+    csv_bytes: &[u8],
+    wanted: &std::collections::HashSet<i64>,
+) -> std::collections::HashMap<i64, Book> {
+    let mut found = std::collections::HashMap::new();
     let mut rdr = csv::ReaderBuilder::new()
         .flexible(true)
-        .from_reader(&csv_bytes[..]);
+        .from_reader(csv_bytes);
     for row in rdr.deserialize::<CatalogRow>() {
         let row = match row {
             Ok(r) => r,
@@ -539,6 +563,50 @@ pub async fn ingest_ids(db_path: &str, cfg: &IngestConfig, ids: &[i64]) -> Resul
             },
         );
     }
+    found
+}
+
+/// Resolve exact (case-insensitive, trimmed) titles to catalog ids, in catalog
+/// order, de-duplicated. Pure — testable without network.
+fn ids_for_titles(csv_bytes: &[u8], titles: &[String]) -> Vec<i64> {
+    let wanted: std::collections::HashSet<String> =
+        titles.iter().map(|t| t.trim().to_lowercase()).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut rdr = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(csv_bytes);
+    for row in rdr.deserialize::<CatalogRow>() {
+        let row = match row {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !row.kind.eq_ignore_ascii_case("Text") {
+            continue;
+        }
+        if !wanted.contains(&row.title.trim().to_lowercase()) {
+            continue;
+        }
+        if let Ok(id) = row.id.trim().parse::<i64>() {
+            if seen.insert(id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Shared store path: fetch text for each wanted id and insert it. Skips ids
+/// already in the library or absent from the catalog. Returns the count stored.
+async fn store_ids(
+    db_path: &str,
+    client: &reqwest::Client,
+    csv_bytes: &[u8],
+    ids: &[i64],
+) -> Result<usize> {
+    let throttle = Throttle::from_default();
+    let wanted: std::collections::HashSet<i64> = ids.iter().copied().collect();
+    let mut found = collect_books(csv_bytes, &wanted);
 
     let mut conn =
         rusqlite::Connection::open(db_path).with_context(|| format!("opening db {db_path}"))?;
@@ -553,7 +621,7 @@ pub async fn ingest_ids(db_path: &str, cfg: &IngestConfig, ids: &[i64]) -> Resul
             eprintln!("ingest: #{id} already in library, skipping");
             continue;
         }
-        match fetch_book_text(&client, &throttle, book.gutenberg_id).await {
+        match fetch_book_text(client, &throttle, book.gutenberg_id).await {
             Ok((url, body)) => {
                 book.text_url = Some(url);
                 book.body = Some(strip_pg_boilerplate(&body));
@@ -619,6 +687,42 @@ mod tests {
         // limit is honored
         let limited = search_rows(csv.as_bytes(), "a", 2);
         assert_eq!(limited.len(), 2);
+    }
+
+    const SAMPLE_CSV: &str = "Text#,Type,Issued,Title,Language,Authors\n\
+         1342,Text,1813-01-28,Pride and Prejudice,en,\"Austen, Jane, 1775-1817\"\n\
+         9999,Sound,2001-01-01,Frankenstein,en,\"Shelley, Mary\"\n\
+         84,Text,1818-03-11,Frankenstein,en,\"Shelley, Mary, 1797-1851\"\n";
+
+    #[test]
+    fn ids_for_titles_exact_case_insensitive_text_only() {
+        // exact title match, case-insensitive; the 'Sound' Frankenstein is excluded
+        let ids = ids_for_titles(SAMPLE_CSV.as_bytes(), &["frankenstein".to_string()]);
+        assert_eq!(ids, vec![84]);
+
+        // a substring (not exact) does NOT match
+        let none = ids_for_titles(SAMPLE_CSV.as_bytes(), &["pride".to_string()]);
+        assert!(none.is_empty());
+
+        // multiple titles resolve together
+        let both = ids_for_titles(
+            SAMPLE_CSV.as_bytes(),
+            &[
+                "Pride and Prejudice".to_string(),
+                "FRANKENSTEIN".to_string(),
+            ],
+        );
+        assert_eq!(both, vec![1342, 84]);
+    }
+
+    #[test]
+    fn collect_books_only_wanted_text_rows() {
+        let wanted: std::collections::HashSet<i64> = [84, 9999].into_iter().collect();
+        let found = collect_books(SAMPLE_CSV.as_bytes(), &wanted);
+        // 84 is Text and wanted; 9999 is Sound (skipped despite being wanted)
+        assert!(found.contains_key(&84));
+        assert!(!found.contains_key(&9999));
+        assert_eq!(found[&84].title, "Frankenstein");
     }
 
     #[test]
