@@ -621,16 +621,32 @@ async fn store_ids(
             eprintln!("ingest: #{id} already in library, skipping");
             continue;
         }
-        match fetch_book_text(client, &throttle, book.gutenberg_id).await {
-            Ok((url, body)) => {
-                book.text_url = Some(url);
-                book.body = Some(strip_pg_boilerplate(&body));
+        // Curated ingest requires usable text: the hook stage only seeds books
+        // with a non-empty body, so storing a body-less row would report the
+        // book as added while leaving it un-producible AND un-retryable (since
+        // book_exists would then skip it). On a text failure we skip the insert
+        // so a later `add` can try again.
+        let (url, raw) = match fetch_book_text(client, &throttle, book.gutenberg_id).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!(
+                    "ingest: text fetch failed for #{} ({}): {e:#} — not added, retry later",
+                    book.gutenberg_id, book.title
+                );
+                continue;
             }
-            Err(e) => eprintln!(
-                "ingest: text fetch failed for #{} ({}): {e:#}",
+        };
+        let body = strip_pg_boilerplate(&raw);
+        if body.trim().is_empty() {
+            eprintln!(
+                "ingest: #{} ({}) has no usable text after stripping — not added",
                 book.gutenberg_id, book.title
-            ),
+            );
+            continue;
         }
+        book.text_url = Some(url);
+        book.body = Some(body);
+
         insert_book(&mut conn, &book)
             .with_context(|| format!("inserting book #{}", book.gutenberg_id))?;
         inserted += 1;
