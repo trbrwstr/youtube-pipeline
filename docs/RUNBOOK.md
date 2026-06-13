@@ -143,6 +143,32 @@ toward what pays. The one knob you tune over time is `exploit_weight` (start
 
 ---
 
+## 5a. Curating specific titles
+
+`ingest` pulls the catalog broadly (English, `max_issued_year`, …). To target a
+specific book instead, search the Gutenberg catalog by title/author and ingest
+the matches you pick — this bypasses the year filter, so you can grab any title.
+
+```bash
+# Search the catalog (read-only): prints id, year, lang, title, author,
+# and marks anything already in this niche's library.
+pipeline search "frankenstein" --config config/forgotten_classics.toml
+pipeline search "austen" --limit 100
+
+# Ingest the ones you want by Gutenberg id (fetches text + stores them).
+pipeline add --config config/forgotten_classics.toml --ids 84,1342,98
+
+# Then produce as usual — the curated books flow through the same chain.
+pipeline run --config config/forgotten_classics.toml --stages hook,tts,assemble,metadata
+```
+
+Notes:
+- The first `search`/`add` downloads the ~80MB catalog (then it's ETag-cached).
+- `add` skips ids already in the library and reports any id not found.
+- Curated books ignore `max_issued_year`/`language` — you asked for them by id.
+
+---
+
 ## 6. Dry run without live services
 
 Stages degrade gracefully, so you can exercise the front of the chain offline:

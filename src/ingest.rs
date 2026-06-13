@@ -356,7 +356,7 @@ pub fn strip_pg_boilerplate(raw: &str) -> String {
 // SQLite storage
 // ============================================================
 
-fn book_exists(conn: &rusqlite::Connection, gutenberg_id: i64) -> Result<bool> {
+pub fn book_exists(conn: &rusqlite::Connection, gutenberg_id: i64) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(1) FROM books WHERE gutenberg_id = ?1",
         [gutenberg_id],
@@ -385,9 +385,241 @@ fn insert_book(conn: &mut rusqlite::Connection, book: &Book) -> Result<()> {
     Ok(())
 }
 
+// ============================================================
+// Title/author search + curated ingest by id
+// ============================================================
+
+/// One catalog row surfaced by a search — no text fetched yet.
+#[derive(Debug, Clone)]
+pub struct CatalogMatch {
+    pub gutenberg_id: i64,
+    pub title: String,
+    pub author: String,
+    pub language: String,
+    pub issued_year: Option<i32>,
+}
+
+/// True when `title` or `author` contains the (already-lowercased) needle.
+fn matches_query(title: &str, author: &str, needle_lower: &str) -> bool {
+    title.to_lowercase().contains(needle_lower) || author.to_lowercase().contains(needle_lower)
+}
+
+/// Pull the leading 4-digit year out of a catalog `Issued` field.
+fn issued_year(issued: &str) -> Option<i32> {
+    issued.get(0..4).and_then(|y| y.parse::<i32>().ok())
+}
+
+/// First language code from PG's (sometimes multi-valued) Language field.
+fn first_language(language: &str) -> String {
+    language
+        .split([';', ','])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn catalog_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent("yt-pipeline-ingest/0.1 (+contact)")
+        .build()
+        .context("building catalog http client")
+}
+
+/// Search the Gutenberg catalog by case-insensitive title/author substring.
+/// Returns up to `limit` Text-type matches in catalog order, regardless of
+/// year/language — curation deliberately bypasses the niche's broad filter.
+pub async fn search_catalog(
+    cfg: &IngestConfig,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<CatalogMatch>> {
+    let client = catalog_client()?;
+    let csv_bytes = fetch_catalog(&client, cfg)
+        .await
+        .context("fetching pg_catalog.csv.gz")?;
+    Ok(search_rows(&csv_bytes, query, limit))
+}
+
+/// Pure search over decompressed catalog CSV bytes (network-free, testable).
+fn search_rows(csv_bytes: &[u8], query: &str, limit: usize) -> Vec<CatalogMatch> {
+    let needle = query.trim().to_lowercase();
+    let mut rdr = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(csv_bytes);
+
+    let mut out = Vec::new();
+    for row in rdr.deserialize::<CatalogRow>() {
+        let row = match row {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !row.kind.eq_ignore_ascii_case("Text") {
+            continue;
+        }
+        let title = row.title.trim();
+        if title.is_empty() {
+            continue;
+        }
+        let author = clean_author(&row.authors);
+        if !matches_query(title, &author, &needle) {
+            continue;
+        }
+        let id: i64 = match row.id.trim().parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        out.push(CatalogMatch {
+            gutenberg_id: id,
+            title: title.to_string(),
+            author,
+            language: first_language(&row.language),
+            issued_year: issued_year(&row.issued),
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+/// Ingest specific books by Gutenberg id — the curated "I want exactly these"
+/// path. Bypasses the year/language filter, fetches text, and stores. Returns
+/// the number newly inserted (already-present or not-found ids are skipped).
+pub async fn ingest_ids(db_path: &str, cfg: &IngestConfig, ids: &[i64]) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let throttle = Throttle::from_default();
+    let client = catalog_client()?;
+    let csv_bytes = fetch_catalog(&client, cfg)
+        .await
+        .context("fetching pg_catalog.csv.gz")?;
+
+    let wanted: std::collections::HashSet<i64> = ids.iter().copied().collect();
+    let mut found: std::collections::HashMap<i64, Book> = std::collections::HashMap::new();
+
+    let mut rdr = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(&csv_bytes[..]);
+    for row in rdr.deserialize::<CatalogRow>() {
+        let row = match row {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !row.kind.eq_ignore_ascii_case("Text") {
+            continue;
+        }
+        let id: i64 = match row.id.trim().parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if !wanted.contains(&id) {
+            continue;
+        }
+        let title = row.title.trim();
+        if title.is_empty() {
+            continue;
+        }
+        let lang = first_language(&row.language);
+        found.insert(
+            id,
+            Book {
+                gutenberg_id: id,
+                title: title.to_string(),
+                author: clean_author(&row.authors),
+                language: if lang.is_empty() {
+                    "en".to_string()
+                } else {
+                    lang
+                },
+                issued_year: issued_year(&row.issued),
+                text_url: None,
+                body: None,
+            },
+        );
+    }
+
+    let mut conn =
+        rusqlite::Connection::open(db_path).with_context(|| format!("opening db {db_path}"))?;
+
+    let mut inserted = 0usize;
+    for id in ids {
+        let Some(mut book) = found.remove(id) else {
+            eprintln!("ingest: id {id} not found in catalog (or not Text type)");
+            continue;
+        };
+        if book_exists(&conn, book.gutenberg_id)? {
+            eprintln!("ingest: #{id} already in library, skipping");
+            continue;
+        }
+        match fetch_book_text(&client, &throttle, book.gutenberg_id).await {
+            Ok((url, body)) => {
+                book.text_url = Some(url);
+                book.body = Some(strip_pg_boilerplate(&body));
+            }
+            Err(e) => eprintln!(
+                "ingest: text fetch failed for #{} ({}): {e:#}",
+                book.gutenberg_id, book.title
+            ),
+        }
+        insert_book(&mut conn, &book)
+            .with_context(|| format!("inserting book #{}", book.gutenberg_id))?;
+        inserted += 1;
+        println!("ingested #{} — {}", book.gutenberg_id, book.title);
+    }
+    Ok(inserted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matches_query_title_and_author_case_insensitive() {
+        assert!(matches_query("Pride and Prejudice", "Jane Austen", "pride"));
+        assert!(matches_query(
+            "Pride and Prejudice",
+            "Jane Austen",
+            "austen"
+        ));
+        assert!(!matches_query("Moby Dick", "Herman Melville", "pride"));
+    }
+
+    #[test]
+    fn issued_year_parses_leading_year() {
+        assert_eq!(issued_year("1928-05-01"), Some(1928));
+        assert_eq!(issued_year(""), None);
+    }
+
+    #[test]
+    fn first_language_takes_leading_code() {
+        assert_eq!(first_language("en; fr"), "en");
+        assert_eq!(first_language("de"), "de");
+    }
+
+    #[test]
+    fn search_rows_filters_by_type_and_query() {
+        let csv = "Text#,Type,Issued,Title,Language,Authors\n\
+                   1342,Text,1813-01-28,Pride and Prejudice,en,\"Austen, Jane, 1775-1817\"\n\
+                   98,Text,1859-04-30,A Tale of Two Cities,en,\"Dickens, Charles, 1812-1870\"\n\
+                   9999,Sound,2001-01-01,Pride Audiobook,en,\"Someone\"\n\
+                   84,Text,1818-03-11,Frankenstein,en,\"Shelley, Mary, 1797-1851\"\n";
+        // matches title (case-insensitive), excludes the non-Text 'Sound' row
+        let hits = search_rows(csv.as_bytes(), "pride", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].gutenberg_id, 1342);
+        assert_eq!(hits[0].issued_year, Some(1813));
+
+        // matches author across rows
+        let by_author = search_rows(csv.as_bytes(), "shelley", 10);
+        assert_eq!(by_author.len(), 1);
+        assert_eq!(by_author[0].title, "Frankenstein");
+
+        // limit is honored
+        let limited = search_rows(csv.as_bytes(), "a", 2);
+        assert_eq!(limited.len(), 2);
+    }
 
     #[test]
     fn strips_standard_wrapper() {

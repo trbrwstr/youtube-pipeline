@@ -115,6 +115,10 @@ enum Command {
     Retry(RetryArgs),
     /// List dead-letter rows (failed past max attempts).
     Dead(CommonArgs),
+    /// Search the Gutenberg catalog by title/author (read-only).
+    Search(SearchArgs),
+    /// Ingest specific books by Gutenberg id (curated; bypasses the year filter).
+    Add(AddArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -166,6 +170,29 @@ struct RetryArgs {
     stage: Stage,
 }
 
+#[derive(Parser, Debug)]
+struct SearchArgs {
+    #[arg(short, long, default_value = "config/forgotten_classics.toml")]
+    config: String,
+
+    /// Title/author substring to search the catalog for (case-insensitive).
+    query: String,
+
+    /// Max matches to list.
+    #[arg(short, long, default_value_t = 50)]
+    limit: usize,
+}
+
+#[derive(Parser, Debug)]
+struct AddArgs {
+    #[arg(short, long, default_value = "config/forgotten_classics.toml")]
+    config: String,
+
+    /// Gutenberg ids to ingest, e.g. --ids 1342,98,84
+    #[arg(long, value_delimiter = ',', required = true)]
+    ids: Vec<i64>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -176,6 +203,8 @@ async fn main() -> Result<()> {
         Command::Reap(args) => cmd_reap(args),
         Command::Retry(args) => cmd_retry(args),
         Command::Dead(args) => cmd_dead(args),
+        Command::Search(args) => cmd_search(args).await,
+        Command::Add(args) => cmd_add(args).await,
     }
 }
 
@@ -368,5 +397,67 @@ fn cmd_dead(args: CommonArgs) -> Result<()> {
             d.book_id, d.stage, d.attempts, d.last_error
         );
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// search / add — curate specific titles from the Gutenberg catalog
+// ---------------------------------------------------------------------------
+
+async fn cmd_search(args: SearchArgs) -> Result<()> {
+    let cfg = boot(&args.config)?;
+    let conn = db::open_and_init(&cfg.db_path)?;
+
+    let matches = ingest::search_catalog(&cfg.ingest, &args.query, args.limit)
+        .await
+        .context("searching catalog")?;
+
+    if matches.is_empty() {
+        println!("no catalog matches for '{}'", args.query);
+        return Ok(());
+    }
+
+    println!(
+        "=== {} match(es) for '{}' (showing up to {}) ===",
+        matches.len(),
+        args.query,
+        args.limit
+    );
+    let (id_h, year_h, lang_h, title_h, author_h) = ("id", "year", "lang", "title", "author");
+    println!("{id_h:>8}  {year_h:>4}  {lang_h:<4}  {title_h:<45}  {author_h}");
+    for m in &matches {
+        let in_lib = ingest::book_exists(&conn, m.gutenberg_id).unwrap_or(false);
+        let year = m
+            .issued_year
+            .map(|y| y.to_string())
+            .unwrap_or_else(|| "----".into());
+        let title: String = m.title.chars().take(45).collect();
+        println!(
+            "{:>8}  {:>4}  {:<4}  {:<45}  {}{}",
+            m.gutenberg_id,
+            year,
+            m.language,
+            title,
+            m.author,
+            if in_lib { "  [in library]" } else { "" },
+        );
+    }
+    println!(
+        "\nIngest the ones you want:  pipeline add --config {} --ids <id,id,...>",
+        args.config
+    );
+    Ok(())
+}
+
+async fn cmd_add(args: AddArgs) -> Result<()> {
+    let cfg = boot(&args.config)?;
+    let n = ingest::ingest_ids(&cfg.db_path, &cfg.ingest, &args.ids)
+        .await
+        .context("ingesting requested ids")?;
+    println!(
+        "added {n} book(s) to '{}'. Produce them with: \
+         pipeline run --config {} --stages hook,tts,assemble,metadata",
+        cfg.channel.name, args.config
+    );
     Ok(())
 }
