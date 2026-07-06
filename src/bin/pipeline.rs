@@ -2,7 +2,7 @@
 //
 // End-to-end orchestrator + operational CLI for the faceless YouTube pipeline.
 //
-//   run      ingest -> hook -> tts -> assemble -> metadata -> thumbnail -> upload
+//   run      ingest -> hook -> tts -> assemble -> metadata -> upload -> thumbnail
 //   status   per-stage counts (pending / running / done / failed)
 //   reap     reset stale "running" rows whose worker died mid-stage
 //   retry    push failed rows back to pending for a given stage
@@ -46,8 +46,8 @@ impl Stage {
             Stage::Tts,
             Stage::Assemble,
             Stage::Metadata,
-            Stage::Thumbnail,
             Stage::Upload,
+            Stage::Thumbnail,
         ]
     }
 
@@ -71,8 +71,10 @@ impl Stage {
             Stage::Tts => Some(Stage::Hook),
             Stage::Assemble => Some(Stage::Tts),
             Stage::Metadata => Some(Stage::Assemble),
-            Stage::Thumbnail => Some(Stage::Metadata),
-            Stage::Upload => Some(Stage::Thumbnail),
+            // Upload needs only the rendered mp4 + metadata; thumbnail calls
+            // thumbnails.set on the PUBLISHED video, so it must follow upload.
+            Stage::Upload => Some(Stage::Metadata),
+            Stage::Thumbnail => Some(Stage::Upload),
         }
     }
 }

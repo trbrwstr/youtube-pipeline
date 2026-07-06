@@ -41,6 +41,9 @@ pub mod upload; // resumable video upload, writes youtube_id back
 pub mod analytics; // per-video stats -> video_stats time series
 pub mod selector; // revenue-weighted quota allocation -> production_plan
 
+// --- ops: durable schedules + run history for the dashboard's scheduler ---
+pub mod automation;
+
 // --- shared bounded-concurrency stage runner used by both binaries ---
 pub mod runner;
 
@@ -202,9 +205,11 @@ pub mod stages {
     pub const THUMBNAIL: &str = "thumbnail";
     pub const UPLOAD: &str = "upload";
 
-    /// The chain in execution order. `db.rs` and the ops CLI iterate this for
-    /// the status grid so adding a stage here surfaces it everywhere at once.
-    pub const ALL: &[&str] = &[INGEST, HOOK, TTS, ASSEMBLE, METADATA, THUMBNAIL, UPLOAD];
+    /// The chain in execution order — upload precedes thumbnail because
+    /// thumbnails.set needs the published video id. `db.rs` and the ops CLI
+    /// iterate this for the status grid so adding a stage here surfaces it
+    /// everywhere at once.
+    pub const ALL: &[&str] = &[INGEST, HOOK, TTS, ASSEMBLE, METADATA, UPLOAD, THUMBNAIL];
 }
 
 #[cfg(test)]

@@ -19,6 +19,7 @@ This pipeline helps automate the repetitive parts of running faceless or semi-au
 5. **Upload videos to YouTube** through the YouTube API.
 6. **Collect performance data** such as views, watch time, engagement, and revenue where available.
 7. **Adjust future production priorities** based on what performs best.
+8. **Run the whole loop hands-free** from a built-in web dashboard: per-channel schedules, batch sizes, publish toggles, a fleet-wide pause switch, and a run history — all server-side, with no cron jobs or client-side tooling.
 
 The goal is not to replace strategy or creativity. The goal is to remove manual bottlenecks so a creator or business can test ideas faster, publish consistently, and make decisions from real performance data.
 
@@ -63,7 +64,7 @@ Each niche can have its own configuration, voice, visual style, metadata rules, 
 The pipeline follows a clear production chain from content intake to upload. That makes the workflow easier to debug, improve, and delegate.
 
 ```text
-ingest → script/hook → narration → video assembly → metadata → thumbnail → upload → analytics
+ingest → script/hook → narration → video assembly → metadata → upload → thumbnail → analytics
 ```
 
 ### Built for Real Operations
@@ -77,6 +78,10 @@ Different content brands can share the same engine while using different configu
 ### Analytics Feedback Loop
 
 The system can collect YouTube performance data and use it to help decide where future production effort should go. This supports faster testing across niches, formats, and content styles.
+
+### Fully Automated Operation
+
+A built-in web dashboard doubles as the scheduler. Deploy one binary on a server, open the UI, and switch each channel's automation on: the full production chain, daily quota reallocation, and analytics snapshots then run on their own cadence with durable schedules and a complete run history. See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for the operations guide.
 
 ### Practical Automation
 
