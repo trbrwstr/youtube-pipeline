@@ -115,8 +115,72 @@ cargo run --release --bin selector -- --config-dir config
 # 4. Next produce sweep reads its batch size from quota_for() automatically.
 ```
 
-Put steps 1–3 on a daily cron, or run the orchestrator with `--loop
---interval-secs 86400`.
+Put steps 1–3 on a daily cron, run the orchestrator with `--loop
+--interval-secs 86400`, or — the recommended zero-cron setup — let the
+dashboard's built-in scheduler drive all of it (next section).
+
+---
+
+## 4a. Fully automated: the dashboard scheduler
+
+The dashboard is the one long-running process you deploy. It serves the web
+UI **and** runs the whole loop by itself — no cron, no CLI, nothing on your
+own machine. You configure everything from the browser.
+
+```bash
+cargo run --release --bin dashboard -- \
+  --port 3000 --config-dir config --state-db data/dashboard.db
+```
+
+Open `http://<server>:3000` and use the **Automation** panel:
+
+* **Per channel** — flip it on, set the cadence (`every N minutes`), the
+  per-stage batch size, and whether the cycle should publish (`upload`) and
+  snapshot performance (`analytics`). Each enabled channel then runs the full
+  chain (reap → ingest → hook → tts → assemble → metadata → thumbnail →
+  upload → analytics) on its own schedule, server-side.
+* **Daily selector** — once a day (at the UTC hour you pick) the federated
+  selector re-scores every channel and reallocates tomorrow's production
+  quotas, so the feedback loop closes without any manual step.
+* **Pause All** — the master switch. Halts every automated action instantly
+  without touching per-channel settings; Resume picks the schedule back up.
+* **Run now** — fires a channel's cycle immediately, outside its cadence.
+  A channel never runs two cycles at once; run-now on a busy channel is
+  refused (HTTP 409).
+* **Automation Runs** — the history table at the bottom shows every cycle
+  with a per-stage item count (`ingest:3 hook:3 …`) or the error that
+  stopped it.
+
+Schedules, the pause switch, and run history live in the ops DB
+(`--state-db`, default `data/dashboard.db`) — separate from the per-niche
+pipeline DBs — so a restart or redeploy resumes the schedule where it left
+off. Uploads publish with each niche's configured `privacy_status`; leave a
+new channel's `upload` unchecked (or `privacy_status = "unlisted"`) until
+you've reviewed a few automated cycles end to end.
+
+Run it under systemd so it survives reboots:
+
+```ini
+# /etc/systemd/system/yt-dashboard.service
+[Unit]
+Description=YouTube pipeline dashboard + scheduler
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/youtube-pipeline
+EnvironmentFile=/opt/youtube-pipeline/.env   # YT_*, OPENAI_API_KEY, ...
+ExecStart=/opt/youtube-pipeline/target/release/dashboard --port 3000 --config-dir config
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The dashboard binds `0.0.0.0` and has **no authentication** — it can publish
+to your channels, so never expose the port directly. Keep it on localhost /
+a private network and reach it through an SSH tunnel
+(`ssh -L 3000:localhost:3000 server`), a VPN, or a reverse proxy that adds
+auth.
 
 ### How the feedback loop reallocates across channels
 

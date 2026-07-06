@@ -18,7 +18,7 @@ use axum::{
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -27,7 +27,7 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use youtube_pipeline::{
-    analytics, config::AppConfig, db, ingest, runner, selector, state,
+    analytics, automation, config::AppConfig, db, ingest, runner, selector, state,
 };
 
 // ============================================================
@@ -36,7 +36,13 @@ use youtube_pipeline::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
-    Ingest, Hook, Tts, Assemble, Metadata, Thumbnail, Upload,
+    Ingest,
+    Hook,
+    Tts,
+    Assemble,
+    Metadata,
+    Thumbnail,
+    Upload,
 }
 
 impl Stage {
@@ -64,8 +70,13 @@ impl Stage {
     }
     fn all() -> Vec<Stage> {
         vec![
-            Stage::Ingest, Stage::Hook, Stage::Tts, Stage::Assemble,
-            Stage::Metadata, Stage::Thumbnail, Stage::Upload,
+            Stage::Ingest,
+            Stage::Hook,
+            Stage::Tts,
+            Stage::Assemble,
+            Stage::Metadata,
+            Stage::Thumbnail,
+            Stage::Upload,
         ]
     }
 }
@@ -102,7 +113,12 @@ struct Job {
 #[derive(Default)]
 struct AppState {
     config_dir: String,
+    /// Ops DB for automation schedules + run history (automation.rs).
+    state_db: String,
     jobs: RwLock<HashMap<String, Job>>,
+    /// Niches with an automation cycle in flight — the scheduler's overlap
+    /// guard, so a slow cycle is never doubled by the next tick.
+    auto_running: RwLock<HashSet<String>>,
 }
 
 // ============================================================
@@ -116,21 +132,32 @@ struct Args {
     port: u16,
     #[arg(long, default_value = "config")]
     config_dir: String,
+    /// Ops DB holding automation schedules + run history.
+    #[arg(long, default_value = "data/dashboard.db")]
+    state_db: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "dashboard=debug,tower_http=debug".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "dashboard=debug,tower_http=debug".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     let args = Args::parse();
+    // Fail fast if the ops DB can't be created — automation depends on it.
+    automation::open(&args.state_db).context("initializing automation state db")?;
     let state = Arc::new(AppState {
         config_dir: args.config_dir.clone(),
+        state_db: args.state_db.clone(),
         jobs: RwLock::new(HashMap::new()),
+        auto_running: RwLock::new(HashSet::new()),
     });
+
+    tokio::spawn(automation_loop(Arc::clone(&state)));
 
     let app = Router::new()
         .route("/", get(index_handler))
@@ -149,6 +176,14 @@ async fn main() -> Result<()> {
         .route("/api/orchestrator/run", post(run_orchestrator))
         .route("/api/selector/run", post(run_selector))
         .route("/api/jobs", get(list_jobs))
+        .route("/api/automation", get(get_automation))
+        .route("/api/automation/fleet", post(set_automation_fleet))
+        .route("/api/automation/niches/:niche", post(set_automation_niche))
+        .route(
+            "/api/automation/niches/:niche/run-now",
+            post(automation_run_now),
+        )
+        .route("/api/automation/runs", get(automation_runs))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -179,7 +214,9 @@ fn discover_configs(config_dir: &str) -> Result<Vec<PathBuf>> {
 
 fn niche_path(config_dir: &str, niche: &str) -> Result<PathBuf> {
     let p = std::path::Path::new(config_dir).join(format!("{niche}.toml"));
-    if !p.exists() { bail!("niche config not found: {}", p.display()); }
+    if !p.exists() {
+        bail!("niche config not found: {}", p.display());
+    }
     Ok(p)
 }
 
@@ -189,12 +226,16 @@ fn load_config(path: &std::path::Path) -> Result<AppConfig> {
 }
 
 async fn spawn_job<F>(state: &Arc<AppState>, niche: &str, kind: &str, f: F)
-where F: FnOnce() -> Result<String> + Send + 'static,
+where
+    F: FnOnce() -> Result<String> + Send + 'static,
 {
     let id = format!("{}-{}", niche, chrono::Utc::now().timestamp_millis());
     let job = Job {
-        id: id.clone(), niche: niche.to_string(), kind: kind.to_string(),
-        status: "running".into(), message: "started".into(),
+        id: id.clone(),
+        niche: niche.to_string(),
+        kind: kind.to_string(),
+        status: "running".into(),
+        message: "started".into(),
     };
     state.jobs.write().await.insert(id.clone(), job);
     let state2 = Arc::clone(state);
@@ -203,10 +244,14 @@ where F: FnOnce() -> Result<String> + Send + 'static,
             Ok(m) => m,
             Err(e) => format!("error: {e:#}"),
         };
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             if let Some(j) = state2.jobs.write().await.get_mut(&id) {
-                j.status = "done".into(); j.message = msg;
+                j.status = "done".into();
+                j.message = msg;
             }
         });
     });
@@ -217,62 +262,101 @@ where F: FnOnce() -> Result<String> + Send + 'static,
 // ============================================================
 
 #[derive(Serialize)]
-struct NichesResponse { niches: Vec<NicheSummary> }
+struct NichesResponse {
+    niches: Vec<NicheSummary>,
+}
 
 #[derive(Serialize)]
 struct NicheSummary {
-    name: String, niche: String, format: String,
-    config_path: String, db_path: String, stages: Vec<StageSummary>,
+    name: String,
+    niche: String,
+    format: String,
+    config_path: String,
+    db_path: String,
+    stages: Vec<StageSummary>,
 }
 
 #[derive(Serialize)]
 struct StageSummary {
-    stage: String, pending: i64, running: i64,
-    done: i64, failed: i64, dead: i64,
+    stage: String,
+    pending: i64,
+    running: i64,
+    done: i64,
+    failed: i64,
+    dead: i64,
 }
 
-async fn list_niches(State(state): State<Arc<AppState>>)
--> Result<Json<NichesResponse>, StatusCode> {
+async fn list_niches(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<NichesResponse>, StatusCode> {
     let configs = discover_configs(&state.config_dir).map_err(|e| {
-        tracing::error!("discover configs: {e:#}"); StatusCode::INTERNAL_SERVER_ERROR
+        tracing::error!("discover configs: {e:#}");
+        StatusCode::INTERNAL_SERVER_ERROR
     })?;
     let mut niches = Vec::with_capacity(configs.len());
     for path in configs {
-        let _niche_name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+        let _niche_name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
         let cfg = match load_config(&path) {
             Ok(c) => c,
-            Err(e) => { tracing::warn!("skip {}: {e:#}", path.display()); continue; }
+            Err(e) => {
+                tracing::warn!("skip {}: {e:#}", path.display());
+                continue;
+            }
         };
         let stages = match db::open_and_init(&cfg.db_path) {
-            Ok(conn) => Stage::all().iter().map(|stage| {
-                let c = state::stage_counts_for(&conn, stage.label()).unwrap_or_default();
-                StageSummary {
-                    stage: stage.label().to_string(), pending: c.pending, running: c.running,
-                    done: c.done, failed: c.failed, dead: c.dead,
-                }
-            }).collect(),
+            Ok(conn) => Stage::all()
+                .iter()
+                .map(|stage| {
+                    let c = state::stage_counts_for(&conn, stage.label()).unwrap_or_default();
+                    StageSummary {
+                        stage: stage.label().to_string(),
+                        pending: c.pending,
+                        running: c.running,
+                        done: c.done,
+                        failed: c.failed,
+                        dead: c.dead,
+                    }
+                })
+                .collect(),
             Err(_) => Vec::new(),
         };
         niches.push(NicheSummary {
-            name: cfg.channel.name, niche: cfg.channel.niche, format: cfg.channel.format,
-            config_path: path.to_string_lossy().into_owned(), db_path: cfg.db_path, stages,
+            name: cfg.channel.name,
+            niche: cfg.channel.niche,
+            format: cfg.channel.format,
+            config_path: path.to_string_lossy().into_owned(),
+            db_path: cfg.db_path,
+            stages,
         });
     }
     Ok(Json(NichesResponse { niches }))
 }
 
-async fn niche_status(State(state): State<Arc<AppState>>, Path(niche): Path<String>)
--> Result<Json<Vec<StageSummary>>, StatusCode> {
+async fn niche_status(
+    State(state): State<Arc<AppState>>,
+    Path(niche): Path<String>,
+) -> Result<Json<Vec<StageSummary>>, StatusCode> {
     let path = niche_path(&state.config_dir, &niche).map_err(|_| StatusCode::NOT_FOUND)?;
     let cfg = load_config(&path).map_err(|_| StatusCode::NOT_FOUND)?;
     let conn = db::open_and_init(&cfg.db_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let out = Stage::all().iter().map(|stage| {
-        let c = state::stage_counts_for(&conn, stage.label()).unwrap_or_default();
-        StageSummary {
-            stage: stage.label().to_string(), pending: c.pending, running: c.running,
-            done: c.done, failed: c.failed, dead: c.dead,
-        }
-    }).collect();
+    let out = Stage::all()
+        .iter()
+        .map(|stage| {
+            let c = state::stage_counts_for(&conn, stage.label()).unwrap_or_default();
+            StageSummary {
+                stage: stage.label().to_string(),
+                pending: c.pending,
+                running: c.running,
+                done: c.done,
+                failed: c.failed,
+                dead: c.dead,
+            }
+        })
+        .collect();
     Ok(Json(out))
 }
 
@@ -282,117 +366,204 @@ async fn niche_status(State(state): State<Arc<AppState>>, Path(niche): Path<Stri
 
 #[derive(Deserialize)]
 struct RunRequest {
-    stages: Option<Vec<String>>, limit: Option<usize>,
-    #[serde(default)] no_upload: bool,
+    stages: Option<Vec<String>>,
+    limit: Option<usize>,
+    #[serde(default)]
+    no_upload: bool,
 }
 
 #[derive(Serialize)]
-struct ActionResponse { job_id: String, status: String }
+struct ActionResponse {
+    job_id: String,
+    status: String,
+}
 
 async fn run_one_stage(stage: Stage, cfg: &AppConfig, limit: usize) -> Result<usize> {
     if stage == Stage::Ingest {
         let lim = runner::produce_limit(cfg, limit);
-        return ingest::run_batch(&cfg.db_path, &cfg.ingest, lim).await.context("ingest stage");
+        return ingest::run_batch(&cfg.db_path, &cfg.ingest, lim)
+            .await
+            .context("ingest stage");
     }
-    let lim = if stage == Stage::Hook { runner::produce_limit(cfg, limit) } else { limit };
-    runner::run_stage(cfg, stage.label(), stage.depends_on().map(|d| d.label()), lim)
-        .await.with_context(|| format!("{} stage", stage.label()))
+    let lim = if stage == Stage::Hook {
+        runner::produce_limit(cfg, limit)
+    } else {
+        limit
+    };
+    runner::run_stage(
+        cfg,
+        stage.label(),
+        stage.depends_on().map(|d| d.label()),
+        lim,
+    )
+    .await
+    .with_context(|| format!("{} stage", stage.label()))
 }
 
-async fn run_niche(State(state): State<Arc<AppState>>, Path(niche): Path<String>, Json(req): Json<RunRequest>)
--> Result<Json<ActionResponse>, StatusCode> {
+async fn run_niche(
+    State(state): State<Arc<AppState>>,
+    Path(niche): Path<String>,
+    Json(req): Json<RunRequest>,
+) -> Result<Json<ActionResponse>, StatusCode> {
     let path = niche_path(&state.config_dir, &niche).map_err(|_| StatusCode::NOT_FOUND)?;
     let cfg = load_config(&path).map_err(|_| StatusCode::NOT_FOUND)?;
     let limit = req.limit.unwrap_or(50);
     let mut plan: Vec<Stage> = match req.stages {
-        Some(s) => s.iter().map(|x| x.parse()).collect::<Result<_>>().map_err(|_| StatusCode::BAD_REQUEST)?,
+        Some(s) => s
+            .iter()
+            .map(|x| x.parse())
+            .collect::<Result<_>>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
         None => Stage::all(),
     };
-    if req.no_upload { plan.retain(|s| *s != Stage::Upload); }
+    if req.no_upload {
+        plan.retain(|s| *s != Stage::Upload);
+    }
 
     let job_id = format!("{}-{}", niche, chrono::Utc::now().timestamp_millis());
     let job = Job {
-        id: job_id.clone(), niche: niche.clone(), kind: "run".into(),
+        id: job_id.clone(),
+        niche: niche.clone(),
+        kind: "run".into(),
         status: "running".into(),
-        message: format!("stages: {}", plan.iter().map(|s| s.label()).collect::<Vec<_>>().join(", ")),
+        message: format!(
+            "stages: {}",
+            plan.iter()
+                .map(|s| s.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     };
     state.jobs.write().await.insert(job_id.clone(), job);
 
     let state2 = Arc::clone(&state);
     let id2 = job_id.clone();
     tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let mut ok = 0usize;
             for stage in plan {
                 match run_one_stage(stage, &cfg, limit).await {
-                    Result::Ok(n) => { tracing::info!("[{niche}] {} done :: {n} items", stage.label()); ok += 1; }
-                    Result::Err(e) => { tracing::error!("[{niche}] {} failed: {e:#}", stage.label()); break; }
+                    Result::Ok(n) => {
+                        tracing::info!("[{niche}] {} done :: {n} items", stage.label());
+                        ok += 1;
+                    }
+                    Result::Err(e) => {
+                        tracing::error!("[{niche}] {} failed: {e:#}", stage.label());
+                        break;
+                    }
                 }
             }
             let msg = format!("{ok} stage(s) completed");
             if let Some(j) = state2.jobs.write().await.get_mut(&id2) {
-                j.status = "done".into(); j.message = msg;
+                j.status = "done".into();
+                j.message = msg;
             }
         });
     });
-    Ok(Json(ActionResponse { job_id, status: "running".into() }))
+    Ok(Json(ActionResponse {
+        job_id,
+        status: "running".into(),
+    }))
 }
 
 #[derive(Deserialize)]
-struct ReapRequest { stale_secs: Option<i64> }
+struct ReapRequest {
+    stale_secs: Option<i64>,
+}
 
-async fn reap_niche(State(state): State<Arc<AppState>>, Path(niche): Path<String>, Json(req): Json<ReapRequest>)
--> Result<Json<ActionResponse>, StatusCode> {
+async fn reap_niche(
+    State(state): State<Arc<AppState>>,
+    Path(niche): Path<String>,
+    Json(req): Json<ReapRequest>,
+) -> Result<Json<ActionResponse>, StatusCode> {
     let path = niche_path(&state.config_dir, &niche).map_err(|_| StatusCode::NOT_FOUND)?;
     let cfg = load_config(&path).map_err(|_| StatusCode::NOT_FOUND)?;
     let stale = req.stale_secs.unwrap_or(900);
     spawn_job(&state, &niche, "reap", move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let conn = db::open_and_init(&cfg.db_path)?;
             let n = state::reap_stale(&conn, stale, cfg.max_attempts)?;
             Ok(format!("reaped {n} stale row(s)"))
         })
-    }).await;
+    })
+    .await;
     let id = format!("{}-{}", niche, chrono::Utc::now().timestamp_millis());
-    Ok(Json(ActionResponse { job_id: id, status: "running".into() }))
+    Ok(Json(ActionResponse {
+        job_id: id,
+        status: "running".into(),
+    }))
 }
 
 #[derive(Deserialize)]
-struct RetryRequest { stage: String }
+struct RetryRequest {
+    stage: String,
+}
 
-async fn retry_niche(State(state): State<Arc<AppState>>, Path(niche): Path<String>, Json(req): Json<RetryRequest>)
--> Result<Json<ActionResponse>, StatusCode> {
+async fn retry_niche(
+    State(state): State<Arc<AppState>>,
+    Path(niche): Path<String>,
+    Json(req): Json<RetryRequest>,
+) -> Result<Json<ActionResponse>, StatusCode> {
     let path = niche_path(&state.config_dir, &niche).map_err(|_| StatusCode::NOT_FOUND)?;
     let cfg = load_config(&path).map_err(|_| StatusCode::NOT_FOUND)?;
     let stage = req.stage;
     spawn_job(&state, &niche, "retry", move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let conn = db::open_and_init(&cfg.db_path)?;
             let n = state::retry_stage(&conn, &stage)?;
             Ok(format!("revived {n} failed row(s) for {stage}"))
         })
-    }).await;
+    })
+    .await;
     let id = format!("{}-{}", niche, chrono::Utc::now().timestamp_millis());
-    Ok(Json(ActionResponse { job_id: id, status: "running".into() }))
+    Ok(Json(ActionResponse {
+        job_id: id,
+        status: "running".into(),
+    }))
 }
 
 #[derive(Serialize)]
-struct DeadResponse { rows: Vec<DeadRowJson> }
+struct DeadResponse {
+    rows: Vec<DeadRowJson>,
+}
 #[derive(Serialize)]
-struct DeadRowJson { book_id: i64, stage: String, attempts: i64, last_error: String }
+struct DeadRowJson {
+    book_id: i64,
+    stage: String,
+    attempts: i64,
+    last_error: String,
+}
 
-async fn dead_niche(State(state): State<Arc<AppState>>, Path(niche): Path<String>)
--> Result<Json<DeadResponse>, StatusCode> {
+async fn dead_niche(
+    State(state): State<Arc<AppState>>,
+    Path(niche): Path<String>,
+) -> Result<Json<DeadResponse>, StatusCode> {
     let path = niche_path(&state.config_dir, &niche).map_err(|_| StatusCode::NOT_FOUND)?;
     let cfg = load_config(&path).map_err(|_| StatusCode::NOT_FOUND)?;
     let conn = db::open_and_init(&cfg.db_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let rows = state::dead_letters(&conn, None, 200).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let out = rows.into_iter().map(|r| DeadRowJson {
-        book_id: r.book_id, stage: r.stage, attempts: r.attempts, last_error: r.last_error,
-    }).collect();
+    let rows =
+        state::dead_letters(&conn, None, 200).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let out = rows
+        .into_iter()
+        .map(|r| DeadRowJson {
+            book_id: r.book_id,
+            stage: r.stage,
+            attempts: r.attempts,
+            last_error: r.last_error,
+        })
+        .collect();
     Ok(Json(DeadResponse { rows: out }))
 }
 
@@ -401,63 +572,120 @@ async fn dead_niche(State(state): State<Arc<AppState>>, Path(niche): Path<String
 // ============================================================
 
 #[derive(Serialize)]
-struct BooksResponse { books: Vec<BookJson> }
+struct BooksResponse {
+    books: Vec<BookJson>,
+}
 #[derive(Serialize)]
-struct BookJson { id: i64, gutenberg_id: i64, title: String, author: String, language: String, issued_year: Option<i32> }
+struct BookJson {
+    id: i64,
+    gutenberg_id: i64,
+    title: String,
+    author: String,
+    language: String,
+    issued_year: Option<i32>,
+}
 
-async fn list_books(State(state): State<Arc<AppState>>, Path(niche): Path<String>)
--> Result<Json<BooksResponse>, StatusCode> {
+async fn list_books(
+    State(state): State<Arc<AppState>>,
+    Path(niche): Path<String>,
+) -> Result<Json<BooksResponse>, StatusCode> {
     let path = niche_path(&state.config_dir, &niche).map_err(|_| StatusCode::NOT_FOUND)?;
     let cfg = load_config(&path).map_err(|_| StatusCode::NOT_FOUND)?;
     let conn = db::open_and_init(&cfg.db_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut stmt = conn.prepare("SELECT id, gutenberg_id, title, author, language, issued_year FROM books ORDER BY id DESC LIMIT 200")
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let rows = stmt.query_map([], |r| Ok(BookJson {
-        id: r.get(0)?, gutenberg_id: r.get(1)?, title: r.get(2)?,
-        author: r.get(3)?, language: r.get(4)?, issued_year: r.get(5)?,
-    })).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let books: Vec<BookJson> = rows.collect::<Result<_, _>>().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(BookJson {
+                id: r.get(0)?,
+                gutenberg_id: r.get(1)?,
+                title: r.get(2)?,
+                author: r.get(3)?,
+                language: r.get(4)?,
+                issued_year: r.get(5)?,
+            })
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let books: Vec<BookJson> = rows
+        .collect::<Result<_, _>>()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(BooksResponse { books }))
 }
 
 #[derive(Serialize)]
-struct FramesResponse { frames: Vec<FrameJson> }
+struct FramesResponse {
+    frames: Vec<FrameJson>,
+}
 #[derive(Serialize)]
-struct FrameJson { book_id: i64, hook_text: Option<String>, audio_path: Option<String>, output_path: Option<String>, youtube_id: Option<String> }
+struct FrameJson {
+    book_id: i64,
+    hook_text: Option<String>,
+    audio_path: Option<String>,
+    output_path: Option<String>,
+    youtube_id: Option<String>,
+}
 
-async fn list_frames(State(state): State<Arc<AppState>>, Path(niche): Path<String>)
--> Result<Json<FramesResponse>, StatusCode> {
+async fn list_frames(
+    State(state): State<Arc<AppState>>,
+    Path(niche): Path<String>,
+) -> Result<Json<FramesResponse>, StatusCode> {
     let path = niche_path(&state.config_dir, &niche).map_err(|_| StatusCode::NOT_FOUND)?;
     let cfg = load_config(&path).map_err(|_| StatusCode::NOT_FOUND)?;
     let conn = db::open_and_init(&cfg.db_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut stmt = conn.prepare("SELECT book_id, hook_text, audio_path, output_path, youtube_id FROM script_frames ORDER BY book_id DESC LIMIT 200")
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let rows = stmt.query_map([], |r| Ok(FrameJson {
-        book_id: r.get(0)?, hook_text: r.get(1)?, audio_path: r.get(2)?,
-        output_path: r.get(3)?, youtube_id: r.get(4)?,
-    })).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let frames: Vec<FrameJson> = rows.collect::<Result<_, _>>().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(FrameJson {
+                book_id: r.get(0)?,
+                hook_text: r.get(1)?,
+                audio_path: r.get(2)?,
+                output_path: r.get(3)?,
+                youtube_id: r.get(4)?,
+            })
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let frames: Vec<FrameJson> = rows
+        .collect::<Result<_, _>>()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(FramesResponse { frames }))
 }
 
 #[derive(Deserialize)]
-struct IngestRequest { ids: Option<Vec<i64>>, titles: Option<Vec<String>> }
+struct IngestRequest {
+    ids: Option<Vec<i64>>,
+    titles: Option<Vec<String>>,
+}
 
-async fn ingest_books(State(state): State<Arc<AppState>>, Path(niche): Path<String>, Json(req): Json<IngestRequest>)
--> Result<Json<ActionResponse>, StatusCode> {
+async fn ingest_books(
+    State(state): State<Arc<AppState>>,
+    Path(niche): Path<String>,
+    Json(req): Json<IngestRequest>,
+) -> Result<Json<ActionResponse>, StatusCode> {
     let path = niche_path(&state.config_dir, &niche).map_err(|_| StatusCode::NOT_FOUND)?;
     let cfg = load_config(&path).map_err(|_| StatusCode::NOT_FOUND)?;
     spawn_job(&state, &niche, "ingest", move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let mut added = 0usize;
-            if let Some(ids) = req.ids { added += ingest::ingest_ids(&cfg.db_path, &cfg.ingest, &ids).await?; }
-            if let Some(titles) = req.titles { added += ingest::ingest_titles(&cfg.db_path, &cfg.ingest, &titles).await?; }
+            if let Some(ids) = req.ids {
+                added += ingest::ingest_ids(&cfg.db_path, &cfg.ingest, &ids).await?;
+            }
+            if let Some(titles) = req.titles {
+                added += ingest::ingest_titles(&cfg.db_path, &cfg.ingest, &titles).await?;
+            }
             Ok(format!("added {added} book(s)"))
         })
-    }).await;
+    })
+    .await;
     let id = format!("{}-{}", niche, chrono::Utc::now().timestamp_millis());
-    Ok(Json(ActionResponse { job_id: id, status: "running".into() }))
+    Ok(Json(ActionResponse {
+        job_id: id,
+        status: "running".into(),
+    }))
 }
 
 // ============================================================
@@ -465,104 +693,185 @@ async fn ingest_books(State(state): State<Arc<AppState>>, Path(niche): Path<Stri
 // ============================================================
 
 #[derive(Serialize)]
-struct PlanResponse { plans: Vec<PlanRow> }
+struct PlanResponse {
+    plans: Vec<PlanRow>,
+}
 #[derive(Serialize)]
-struct PlanRow { run_date: String, niche: String, format: String, quota: i64, reason: String }
+struct PlanRow {
+    run_date: String,
+    niche: String,
+    format: String,
+    quota: i64,
+    reason: String,
+}
 
-async fn production_plan(State(state): State<Arc<AppState>>, Path(niche): Path<String>)
--> Result<Json<PlanResponse>, StatusCode> {
+async fn production_plan(
+    State(state): State<Arc<AppState>>,
+    Path(niche): Path<String>,
+) -> Result<Json<PlanResponse>, StatusCode> {
     let path = niche_path(&state.config_dir, &niche).map_err(|_| StatusCode::NOT_FOUND)?;
     let cfg = load_config(&path).map_err(|_| StatusCode::NOT_FOUND)?;
     let conn = db::open_and_init(&cfg.db_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut stmt = conn.prepare("SELECT run_date, niche, format, quota, reason FROM production_plan ORDER BY run_date DESC LIMIT 30")
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let rows = stmt.query_map([], |r| Ok(PlanRow {
-        run_date: r.get(0)?, niche: r.get(1)?, format: r.get(2)?,
-        quota: r.get(3)?, reason: r.get(4)?,
-    })).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let plans: Vec<PlanRow> = rows.collect::<Result<_, _>>().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(PlanRow {
+                run_date: r.get(0)?,
+                niche: r.get(1)?,
+                format: r.get(2)?,
+                quota: r.get(3)?,
+                reason: r.get(4)?,
+            })
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let plans: Vec<PlanRow> = rows
+        .collect::<Result<_, _>>()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(PlanResponse { plans }))
 }
 
 #[derive(Serialize)]
-struct StatsResponse { stats: Vec<StatRow> }
+struct StatsResponse {
+    stats: Vec<StatRow>,
+}
 #[derive(Serialize)]
-struct StatRow { video_id: String, snapshot_date: String, views: i64, est_revenue_usd: f64 }
+struct StatRow {
+    video_id: String,
+    snapshot_date: String,
+    views: i64,
+    est_revenue_usd: f64,
+}
 
-async fn video_stats(State(state): State<Arc<AppState>>, Path(niche): Path<String>)
--> Result<Json<StatsResponse>, StatusCode> {
+async fn video_stats(
+    State(state): State<Arc<AppState>>,
+    Path(niche): Path<String>,
+) -> Result<Json<StatsResponse>, StatusCode> {
     let path = niche_path(&state.config_dir, &niche).map_err(|_| StatusCode::NOT_FOUND)?;
     let cfg = load_config(&path).map_err(|_| StatusCode::NOT_FOUND)?;
     let conn = db::open_and_init(&cfg.db_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut stmt = conn.prepare("SELECT video_id, snapshot_date, views, est_revenue_usd FROM video_stats ORDER BY snapshot_date DESC, video_id DESC LIMIT 200")
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let rows = stmt.query_map([], |r| Ok(StatRow {
-        video_id: r.get(0)?, snapshot_date: r.get(1)?,
-        views: r.get(2)?, est_revenue_usd: r.get(3)?,
-    })).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let stats: Vec<StatRow> = rows.collect::<Result<_, _>>().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(StatRow {
+                video_id: r.get(0)?,
+                snapshot_date: r.get(1)?,
+                views: r.get(2)?,
+                est_revenue_usd: r.get(3)?,
+            })
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let stats: Vec<StatRow> = rows
+        .collect::<Result<_, _>>()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(StatsResponse { stats }))
 }
 
-async fn run_analytics(State(state): State<Arc<AppState>>, Path(niche): Path<String>)
--> Result<Json<ActionResponse>, StatusCode> {
+async fn run_analytics(
+    State(state): State<Arc<AppState>>,
+    Path(niche): Path<String>,
+) -> Result<Json<ActionResponse>, StatusCode> {
     let path = niche_path(&state.config_dir, &niche).map_err(|_| StatusCode::NOT_FOUND)?;
     let cfg = load_config(&path).map_err(|_| StatusCode::NOT_FOUND)?;
     spawn_job(&state, &niche, "analytics", move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let conn = db::open_and_init(&cfg.db_path)?;
             db::set_channel_meta(&conn, &cfg.channel.niche, &cfg.channel.format)?;
             let n = analytics::run(&conn, &cfg, 2).await?;
             Ok(format!("recorded {n} snapshot(s)"))
         })
-    }).await;
+    })
+    .await;
     let id = format!("{}-{}", niche, chrono::Utc::now().timestamp_millis());
-    Ok(Json(ActionResponse { job_id: id, status: "running".into() }))
+    Ok(Json(ActionResponse {
+        job_id: id,
+        status: "running".into(),
+    }))
 }
 
 #[derive(Deserialize)]
 struct OrchestratorRequest {
-    stages: Option<Vec<String>>, limit: Option<usize>,
-    #[serde(default)] no_upload: bool, max_parallel: Option<usize>,
+    stages: Option<Vec<String>>,
+    limit: Option<usize>,
+    #[serde(default)]
+    no_upload: bool,
+    max_parallel: Option<usize>,
 }
 
-async fn run_orchestrator(State(state): State<Arc<AppState>>, Json(req): Json<OrchestratorRequest>)
--> Result<Json<ActionResponse>, StatusCode> {
+async fn run_orchestrator(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OrchestratorRequest>,
+) -> Result<Json<ActionResponse>, StatusCode> {
     let config_dir = state.config_dir.clone();
-    let stages = req.stages.map(|s| s.iter().map(|x| x.parse::<Stage>()).collect::<Result<Vec<_>>>())
-        .transpose().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let stages = req
+        .stages
+        .map(|s| {
+            s.iter()
+                .map(|x| x.parse::<Stage>())
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let limit = req.limit.unwrap_or(50);
     let max_parallel = req.max_parallel.unwrap_or(2);
 
     let job_id = format!("fleet-{}", chrono::Utc::now().timestamp_millis());
-    state.jobs.write().await.insert(job_id.clone(), Job {
-        id: job_id.clone(), niche: "fleet".into(), kind: "orchestrator".into(),
-        status: "running".into(), message: "started fleet sweep".into(),
-    });
+    state.jobs.write().await.insert(
+        job_id.clone(),
+        Job {
+            id: job_id.clone(),
+            niche: "fleet".into(),
+            kind: "orchestrator".into(),
+            status: "running".into(),
+            message: "started fleet sweep".into(),
+        },
+    );
     let state2 = Arc::clone(&state);
     let id2 = job_id.clone();
     tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
-            let msg = match run_fleet_sweep(&config_dir, stages, limit, max_parallel, req.no_upload).await {
+            let msg = match run_fleet_sweep(&config_dir, stages, limit, max_parallel, req.no_upload)
+                .await
+            {
                 Ok(n) => format!("{n} niche(s) processed"),
                 Err(e) => format!("error: {e:#}"),
             };
             if let Some(j) = state2.jobs.write().await.get_mut(&id2) {
-                j.status = "done".into(); j.message = msg;
+                j.status = "done".into();
+                j.message = msg;
             }
         });
     });
-    Ok(Json(ActionResponse { job_id, status: "running".into() }))
+    Ok(Json(ActionResponse {
+        job_id,
+        status: "running".into(),
+    }))
 }
 
-async fn run_fleet_sweep(config_dir: &str, stages: Option<Vec<Stage>>, limit: usize, max_parallel: usize, no_upload: bool)
--> Result<usize> {
+async fn run_fleet_sweep(
+    config_dir: &str,
+    stages: Option<Vec<Stage>>,
+    limit: usize,
+    max_parallel: usize,
+    no_upload: bool,
+) -> Result<usize> {
     let mut plan = stages.unwrap_or_else(Stage::all);
-    if no_upload { plan.retain(|s| *s != Stage::Upload); }
+    if no_upload {
+        plan.retain(|s| *s != Stage::Upload);
+    }
     let configs = discover_configs(config_dir)?;
-    if configs.is_empty() { bail!("no configs found"); }
+    if configs.is_empty() {
+        bail!("no configs found");
+    }
     let sem = Arc::new(tokio::sync::Semaphore::new(max_parallel.max(1)));
     let futures = configs.into_iter().enumerate().map(|(idx, path)| {
         let sem = Arc::clone(&sem);
@@ -570,17 +879,33 @@ async fn run_fleet_sweep(config_dir: &str, stages: Option<Vec<Stage>>, limit: us
         async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(750 * idx as u64)).await;
             let _permit = sem.acquire().await.expect("semaphore closed");
-            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string();
             let cfg = match load_config(&path) {
                 Ok(c) => c,
-                Err(e) => { tracing::warn!("[{name}] config load failed: {e:#}"); return Ok(0usize); }
+                Err(e) => {
+                    tracing::warn!("[{name}] config load failed: {e:#}");
+                    return Ok(0usize);
+                }
             };
-            { let conn = db::open_and_init(&cfg.db_path)?; db::set_channel_meta(&conn, &cfg.channel.niche, &cfg.channel.format)?; }
+            {
+                let conn = db::open_and_init(&cfg.db_path)?;
+                db::set_channel_meta(&conn, &cfg.channel.niche, &cfg.channel.format)?;
+            }
             let mut passed = 0usize;
             for stage in plan {
                 match run_one_stage(stage, &cfg, limit).await {
-                    Result::Ok(n) => { tracing::info!("[{name}] {} done :: {n} items", stage.label()); passed += 1; }
-                    Result::Err(e) => { tracing::error!("[{name}] {} failed: {e:#}", stage.label()); break; }
+                    Result::Ok(n) => {
+                        tracing::info!("[{name}] {} done :: {n} items", stage.label());
+                        passed += 1;
+                    }
+                    Result::Err(e) => {
+                        tracing::error!("[{name}] {} failed: {e:#}", stage.label());
+                        break;
+                    }
                 }
             }
             Ok::<usize, anyhow::Error>(passed)
@@ -590,52 +915,76 @@ async fn run_fleet_sweep(config_dir: &str, stages: Option<Vec<Stage>>, limit: us
     Ok(results.into_iter().filter_map(|r| r.ok()).count())
 }
 
-async fn run_selector(State(state): State<Arc<AppState>>)
--> Result<Json<ActionResponse>, StatusCode> {
+async fn run_selector(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ActionResponse>, StatusCode> {
     let config_dir = state.config_dir.clone();
     let job_id = format!("selector-{}", chrono::Utc::now().timestamp_millis());
-    state.jobs.write().await.insert(job_id.clone(), Job {
-        id: job_id.clone(), niche: "fleet".into(), kind: "selector".into(),
-        status: "running".into(), message: "started selector".into(),
-    });
+    state.jobs.write().await.insert(
+        job_id.clone(),
+        Job {
+            id: job_id.clone(),
+            niche: "fleet".into(),
+            kind: "selector".into(),
+            status: "running".into(),
+            message: "started selector".into(),
+        },
+    );
     let state2 = Arc::clone(&state);
     let id2 = job_id.clone();
     tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
-            let msg = match tokio::task::spawn_blocking(move || run_federated_selector(&config_dir)).await {
+            let msg = match tokio::task::spawn_blocking(move || run_federated_selector(&config_dir))
+                .await
+            {
                 Ok(Ok(n)) => format!("wrote {n} plan row(s)"),
                 Ok(Err(e)) => format!("error: {e:#}"),
                 Err(e) => format!("panic: {e:#}"),
             };
             if let Some(j) = state2.jobs.write().await.get_mut(&id2) {
-                j.status = "done".into(); j.message = msg;
+                j.status = "done".into();
+                j.message = msg;
             }
         });
     });
-    Ok(Json(ActionResponse { job_id, status: "running".into() }))
+    Ok(Json(ActionResponse {
+        job_id,
+        status: "running".into(),
+    }))
 }
 
 fn run_federated_selector(config_dir: &str) -> Result<usize> {
     let paths = discover_configs(config_dir)?;
-    if paths.is_empty() { bail!("no .toml configs found"); }
+    if paths.is_empty() {
+        bail!("no .toml configs found");
+    }
     let run_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let mut scores: std::collections::BTreeMap<selector::NicheKey, f64> = std::collections::BTreeMap::new();
-    let mut samples: std::collections::BTreeMap<selector::NicheKey, i64> = std::collections::BTreeMap::new();
+    let mut scores: std::collections::BTreeMap<selector::NicheKey, f64> =
+        std::collections::BTreeMap::new();
+    let mut samples: std::collections::BTreeMap<selector::NicheKey, i64> =
+        std::collections::BTreeMap::new();
     let mut routes: Vec<(selector::NicheKey, rusqlite::Connection)> = Vec::new();
     let mut policy: Option<youtube_pipeline::config::SelectorConfig> = None;
 
     for path in &paths {
         let path_str = path.to_str().context("non-utf8 config path")?;
         let cfg = AppConfig::load(path_str).with_context(|| format!("loading {path_str}"))?;
-        let conn = db::open_and_init(&cfg.db_path).with_context(|| format!("opening db {}", cfg.db_path))?;
+        let conn = db::open_and_init(&cfg.db_path)
+            .with_context(|| format!("opening db {}", cfg.db_path))?;
         db::set_channel_meta(&conn, &cfg.channel.niche, &cfg.channel.format)?;
         let (s, n) = selector::score_niches(&conn)?;
-        scores.extend(s); samples.extend(n);
+        scores.extend(s);
+        samples.extend(n);
         let key = (cfg.channel.niche.clone(), cfg.channel.format.clone());
         scores.entry(key.clone()).or_insert(0.0);
         samples.entry(key.clone()).or_insert(0);
-        if policy.is_none() { policy = Some(cfg.selector.clone()); }
+        if policy.is_none() {
+            policy = Some(cfg.selector.clone());
+        }
         routes.push((key, conn));
     }
     let policy = policy.ok_or_else(|| anyhow::anyhow!("no usable niche policy"))?;
@@ -651,10 +1000,316 @@ fn run_federated_selector(config_dir: &str) -> Result<usize> {
     Ok(wrote)
 }
 
-async fn list_jobs(State(state): State<Arc<AppState>>)
--> Json<Vec<Job>> {
+async fn list_jobs(State(state): State<Arc<AppState>>) -> Json<Vec<Job>> {
     let jobs = state.jobs.read().await.values().cloned().collect();
     Json(jobs)
+}
+
+// ============================================================
+//  Automation: server-side scheduler
+// ============================================================
+//
+// The loop below is what makes the dashboard a set-and-forget appliance:
+// configure cadence in the UI once, leave the process running (systemd, a
+// VPS, anywhere), and it keeps producing + publishing with no client-side
+// cron, terminal, or CLI involved. Every decision it makes is persisted in
+// the ops DB (automation.rs) so a restart resumes the schedule mid-flight.
+
+const TICK_SECS: u64 = 30;
+const REAP_STALE_SECS: i64 = 900;
+
+async fn automation_loop(state: Arc<AppState>) {
+    // Let the listener come up before the first sweep so a fresh deploy's
+    // first page load isn't racing a full pipeline cycle.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    loop {
+        if let Err(e) = automation_tick(&state).await {
+            tracing::warn!("automation tick failed: {e:#}");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(TICK_SECS)).await;
+    }
+}
+
+async fn automation_tick(state: &Arc<AppState>) -> Result<()> {
+    use chrono::Timelike;
+
+    let conn = automation::open(&state.state_db)?;
+    let fleet = automation::get_fleet(&conn)?;
+    if fleet.paused {
+        return Ok(());
+    }
+
+    let now = chrono::Utc::now();
+    let today = now.format("%Y-%m-%d").to_string();
+    let now_ts = now.timestamp();
+
+    // Daily selector pass runs ahead of production so today's cycles pick up
+    // fresh quotas. Stamped before the work so an erroring pass can't storm.
+    if automation::selector_due(&fleet, &today, now.hour() as i64) {
+        automation::mark_selector_ran(&conn, &today)?;
+        spawn_selector_cycle(state, now_ts);
+    }
+
+    for path in discover_configs(&state.config_dir)? {
+        let Some(niche) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let settings = automation::get_niche(&conn, &niche)?;
+        if !automation::niche_due(&settings, now_ts) {
+            continue;
+        }
+        // Overlap guard: a cycle still in flight owns its slot until it ends.
+        if !state.auto_running.write().await.insert(niche.clone()) {
+            continue;
+        }
+        automation::mark_niche_ran(&conn, &niche, now_ts)?;
+        spawn_niche_cycle(state, path, niche, settings, "auto");
+    }
+    Ok(())
+}
+
+/// Run one full production cycle for a niche in the background, recording
+/// start/finish in the run history and releasing the overlap guard at the end.
+fn spawn_niche_cycle(
+    state: &Arc<AppState>,
+    config_path: PathBuf,
+    niche: String,
+    settings: automation::NicheAutomation,
+    kind: &'static str,
+) {
+    let state2 = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let started = chrono::Utc::now().timestamp();
+            let run_id = automation::open(&state2.state_db)
+                .and_then(|c| automation::record_run_start(&c, &niche, kind, started));
+            let (ok, msg) = match run_automation_cycle(&config_path, &settings).await {
+                Result::Ok(m) => (true, m),
+                Result::Err(e) => (false, format!("{e:#}")),
+            };
+            if ok {
+                tracing::info!("[{niche}] automation cycle ok :: {msg}");
+            } else {
+                tracing::error!("[{niche}] automation cycle failed :: {msg}");
+            }
+            if let Result::Ok(id) = run_id {
+                if let Result::Ok(c) = automation::open(&state2.state_db) {
+                    let _ = automation::record_run_finish(
+                        &c,
+                        id,
+                        ok,
+                        &msg,
+                        chrono::Utc::now().timestamp(),
+                    );
+                }
+            }
+            state2.auto_running.write().await.remove(&niche);
+        });
+    });
+}
+
+/// One automated cycle: reap crashed rows, walk the full stage chain (upload
+/// optional), then snapshot analytics. Returns a per-stage item summary.
+async fn run_automation_cycle(
+    config_path: &std::path::Path,
+    settings: &automation::NicheAutomation,
+) -> Result<String> {
+    let cfg = load_config(config_path)?;
+    let limit = settings.batch_limit.max(1) as usize;
+
+    {
+        let conn = db::open_and_init(&cfg.db_path)?;
+        db::set_channel_meta(&conn, &cfg.channel.niche, &cfg.channel.format)?;
+        state::reap_stale(&conn, REAP_STALE_SECS, cfg.max_attempts)?;
+    }
+
+    let mut plan = Stage::all();
+    if !settings.upload_enabled {
+        plan.retain(|s| *s != Stage::Upload);
+    }
+
+    let mut summary: Vec<String> = Vec::new();
+    for stage in plan {
+        let n = run_one_stage(stage, &cfg, limit).await?;
+        summary.push(format!("{}:{n}", stage.label()));
+    }
+    if settings.run_analytics {
+        let conn = db::open_and_init(&cfg.db_path)?;
+        let n = analytics::run(&conn, &cfg, 2).await?;
+        summary.push(format!("analytics:{n}"));
+    }
+    Ok(summary.join(" "))
+}
+
+fn spawn_selector_cycle(state: &Arc<AppState>, now_ts: i64) {
+    let state2 = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let run_id = automation::open(&state2.state_db)
+            .and_then(|c| automation::record_run_start(&c, "fleet", "selector", now_ts));
+        let (ok, msg) = match run_federated_selector(&state2.config_dir) {
+            Result::Ok(n) => (true, format!("wrote {n} plan row(s)")),
+            Result::Err(e) => (false, format!("{e:#}")),
+        };
+        if let Result::Ok(id) = run_id {
+            if let Result::Ok(c) = automation::open(&state2.state_db) {
+                let _ =
+                    automation::record_run_finish(&c, id, ok, &msg, chrono::Utc::now().timestamp());
+            }
+        }
+    });
+}
+
+// ============================================================
+//  API: automation settings + history
+// ============================================================
+
+fn internal(e: anyhow::Error) -> StatusCode {
+    tracing::error!("automation api error: {e:#}");
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+#[derive(Serialize)]
+struct AutomationResponse {
+    fleet: automation::FleetAutomation,
+    niches: Vec<AutomationNicheStatus>,
+}
+
+#[derive(Serialize)]
+struct AutomationNicheStatus {
+    #[serde(flatten)]
+    settings: automation::NicheAutomation,
+    next_run_at: Option<i64>,
+    running: bool,
+}
+
+async fn get_automation(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<AutomationResponse>, StatusCode> {
+    let conn = automation::open(&state.state_db).map_err(internal)?;
+    let fleet = automation::get_fleet(&conn).map_err(internal)?;
+    let configs = discover_configs(&state.config_dir).map_err(internal)?;
+    let running = state.auto_running.read().await.clone();
+    let mut niches = Vec::with_capacity(configs.len());
+    for path in configs {
+        let Some(n) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let settings = automation::get_niche(&conn, n).map_err(internal)?;
+        niches.push(AutomationNicheStatus {
+            next_run_at: settings.next_run_at(),
+            running: running.contains(n),
+            settings,
+        });
+    }
+    Ok(Json(AutomationResponse { fleet, niches }))
+}
+
+#[derive(Deserialize)]
+struct FleetUpdate {
+    paused: Option<bool>,
+    selector_enabled: Option<bool>,
+    selector_hour_utc: Option<i64>,
+}
+
+async fn set_automation_fleet(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<FleetUpdate>,
+) -> Result<Json<automation::FleetAutomation>, StatusCode> {
+    let conn = automation::open(&state.state_db).map_err(internal)?;
+    let mut fleet = automation::get_fleet(&conn).map_err(internal)?;
+    if let Some(v) = req.paused {
+        fleet.paused = v;
+    }
+    if let Some(v) = req.selector_enabled {
+        fleet.selector_enabled = v;
+    }
+    if let Some(v) = req.selector_hour_utc {
+        if !(0..=23).contains(&v) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        fleet.selector_hour_utc = v;
+    }
+    automation::set_fleet(&conn, &fleet).map_err(internal)?;
+    Ok(Json(fleet))
+}
+
+#[derive(Deserialize)]
+struct NicheAutomationUpdate {
+    enabled: Option<bool>,
+    interval_minutes: Option<i64>,
+    batch_limit: Option<i64>,
+    upload_enabled: Option<bool>,
+    run_analytics: Option<bool>,
+}
+
+async fn set_automation_niche(
+    State(state): State<Arc<AppState>>,
+    Path(niche): Path<String>,
+    Json(req): Json<NicheAutomationUpdate>,
+) -> Result<Json<automation::NicheAutomation>, StatusCode> {
+    niche_path(&state.config_dir, &niche).map_err(|_| StatusCode::NOT_FOUND)?;
+    let conn = automation::open(&state.state_db).map_err(internal)?;
+    let mut settings = automation::get_niche(&conn, &niche).map_err(internal)?;
+    if let Some(v) = req.enabled {
+        settings.enabled = v;
+    }
+    if let Some(v) = req.interval_minutes {
+        if v < 5 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        settings.interval_minutes = v;
+    }
+    if let Some(v) = req.batch_limit {
+        if !(1..=500).contains(&v) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        settings.batch_limit = v;
+    }
+    if let Some(v) = req.upload_enabled {
+        settings.upload_enabled = v;
+    }
+    if let Some(v) = req.run_analytics {
+        settings.run_analytics = v;
+    }
+    automation::upsert_niche(&conn, &settings).map_err(internal)?;
+    let settings = automation::get_niche(&conn, &niche).map_err(internal)?;
+    Ok(Json(settings))
+}
+
+async fn automation_run_now(
+    State(state): State<Arc<AppState>>,
+    Path(niche): Path<String>,
+) -> Result<Json<ActionResponse>, StatusCode> {
+    let path = niche_path(&state.config_dir, &niche).map_err(|_| StatusCode::NOT_FOUND)?;
+    let conn = automation::open(&state.state_db).map_err(internal)?;
+    let settings = automation::get_niche(&conn, &niche).map_err(internal)?;
+    if !state.auto_running.write().await.insert(niche.clone()) {
+        return Err(StatusCode::CONFLICT);
+    }
+    let now_ts = chrono::Utc::now().timestamp();
+    automation::mark_niche_ran(&conn, &niche, now_ts).map_err(internal)?;
+    let job_id = format!("{niche}-manual-{now_ts}");
+    spawn_niche_cycle(&state, path, niche, settings, "manual");
+    Ok(Json(ActionResponse {
+        job_id,
+        status: "running".into(),
+    }))
+}
+
+async fn automation_runs(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<automation::RunRecord>>, StatusCode> {
+    let conn = automation::open(&state.state_db).map_err(internal)?;
+    let runs = automation::recent_runs(&conn, 100).map_err(internal)?;
+    Ok(Json(runs))
 }
 
 const INDEX_HTML: &str = r##"<!DOCTYPE html>
@@ -708,6 +1363,22 @@ input{background:var(--bg);border:1px solid var(--border);color:var(--text);padd
 <div class="container">
 
 <div class="card">
+  <h2>Automation</h2>
+  <div id="autoFleet" style="display:flex;gap:1rem;align-items:center;flex-wrap:wrap;margin-bottom:.6rem">Loading...</div>
+  <table id="autoTable" style="display:none">
+    <thead><tr>
+      <th>channel</th><th>on</th><th>every (min)</th><th>batch</th>
+      <th>upload</th><th>analytics</th><th>last run</th><th>next run</th><th></th>
+    </tr></thead>
+    <tbody id="autoRows"></tbody>
+  </table>
+  <div style="color:var(--muted);font-size:.85rem;margin-top:.5rem">
+    Enabled channels run the full chain (ingest &rarr; hook &rarr; tts &rarr; assemble &rarr; metadata &rarr; thumbnail &rarr; upload &rarr; analytics)
+    on their own schedule, server-side. The selector re-allocates daily quotas across channels once a day.
+  </div>
+</div>
+
+<div class="card" style="margin-top:1rem">
   <h2>Fleet Actions</h2>
   <div class="actions">
     <button onclick="runOrchestrator()">Run Orchestrator</button>
@@ -718,6 +1389,10 @@ input{background:var(--bg);border:1px solid var(--border);color:var(--text);padd
 
 <div class="section"><h2>Niches</h2>
   <div id="nichesGrid" class="grid"></div>
+</div>
+
+<div class="section"><h2>Automation Runs</h2>
+  <div id="runsBox" class="card">No runs yet.</div>
 </div>
 
 <div class="section" id="jobsSection" style="display:none">
@@ -808,6 +1483,88 @@ async function loadAll() {
     document.getElementById('connBadge').outerHTML = '<span class="badge bad">disconnected</span>';
     console.error(e);
   }
+  try { renderAutomation(await get('/api/automation')); } catch(e) { console.error(e); }
+  try { renderRuns(await get('/api/automation/runs')); } catch(e) { console.error(e); }
+}
+
+function ts(t) { return t ? new Date(t * 1000).toLocaleString() : '-'; }
+function nextTs(t) {
+  if (t == null) return '-';
+  if (t * 1000 <= Date.now()) return 'due now';
+  return ts(t);
+}
+
+function renderAutomation(data) {
+  // Don't clobber in-progress edits: the page polls every 5s, so skip the
+  // re-render while the user is focused inside the automation controls.
+  const active = document.activeElement;
+  if (active && active.closest && (active.closest('#autoTable') || active.closest('#autoFleet'))) return;
+  const fleet = data.fleet;
+  const box = document.getElementById('autoFleet');
+  box.innerHTML =
+    (fleet.paused
+      ? '<span class="badge bad">PAUSED</span><button onclick="setFleet({paused:false})">Resume Automation</button>'
+      : '<span class="badge ok">ACTIVE</span><button class="warn" onclick="setFleet({paused:true})">Pause All</button>')+
+    '<label style="display:flex;gap:.35rem;align-items:center">'+
+      '<input type="checkbox" '+(fleet.selector_enabled?'checked':'')+' onchange="setFleet({selector_enabled:this.checked})"> daily selector</label>'+
+    '<label style="display:flex;gap:.35rem;align-items:center">at hour (UTC) '+
+      '<input type="number" min="0" max="23" value="'+fleet.selector_hour_utc+'" style="min-width:70px;width:70px" '+
+      'onchange="setFleet({selector_hour_utc:parseInt(this.value)})"></label>'+
+    (fleet.last_selector_date ? '<span class="badge">selector: '+escapeHtml(fleet.last_selector_date)+'</span>' : '');
+
+  const rows = document.getElementById('autoRows');
+  rows.innerHTML = '';
+  for (const n of data.niches) {
+    const id = 'auto-' + n.niche;
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td><strong>'+escapeHtml(n.niche)+'</strong>'+(n.running?' <span class="badge warn">running</span>':'')+'</td>'+
+      '<td><input type="checkbox" id="'+id+'-en" '+(n.enabled?'checked':'')+'></td>'+
+      '<td><input type="number" min="5" id="'+id+'-int" value="'+n.interval_minutes+'" style="min-width:80px;width:80px"></td>'+
+      '<td><input type="number" min="1" max="500" id="'+id+'-lim" value="'+n.batch_limit+'" style="min-width:70px;width:70px"></td>'+
+      '<td><input type="checkbox" id="'+id+'-up" '+(n.upload_enabled?'checked':'')+'></td>'+
+      '<td><input type="checkbox" id="'+id+'-an" '+(n.run_analytics?'checked':'')+'></td>'+
+      '<td>'+ts(n.last_run_at)+'</td>'+
+      '<td>'+nextTs(n.next_run_at)+'</td>'+
+      '<td><div class="actions" style="margin-top:0">'+
+        '<button onclick="saveAutomation(\''+escapeHtml(n.niche)+'\')">Save</button>'+
+        '<button class="secondary" onclick="autoRunNow(\''+escapeHtml(n.niche)+'\')">Run now</button>'+
+      '</div></td>';
+    rows.appendChild(tr);
+  }
+  document.getElementById('autoTable').style.display = data.niches.length ? 'table' : 'none';
+}
+
+async function setFleet(patch) {
+  try { await post('/api/automation/fleet', patch); toast('Automation settings saved'); loadAll(); }
+  catch(e){ toast('Error: '+e.message); }
+}
+
+async function saveAutomation(niche) {
+  const id = 'auto-' + niche;
+  const body = {
+    enabled: document.getElementById(id+'-en').checked,
+    interval_minutes: parseInt(document.getElementById(id+'-int').value),
+    batch_limit: parseInt(document.getElementById(id+'-lim').value),
+    upload_enabled: document.getElementById(id+'-up').checked,
+    run_analytics: document.getElementById(id+'-an').checked,
+  };
+  try { await post('/api/automation/niches/'+encodeURIComponent(niche), body); toast('Saved '+niche); loadAll(); }
+  catch(e){ toast('Error: '+e.message); }
+}
+
+async function autoRunNow(niche) {
+  try { await post('/api/automation/niches/'+encodeURIComponent(niche)+'/run-now', {}); toast('Cycle started for '+niche); loadAll(); }
+  catch(e){ toast(e.message.startsWith('409') ? niche+' is already running' : 'Error: '+e.message); }
+}
+
+function renderRuns(runs) {
+  const box = document.getElementById('runsBox');
+  if (!runs.length) { box.textContent = 'No runs yet.'; return; }
+  box.innerHTML = '<table><thead><tr><th>started</th><th>channel</th><th>kind</th><th>status</th><th>result</th></tr></thead><tbody>'+
+    runs.slice(0, 25).map(r=>'<tr><td>'+ts(r.started_at)+'</td><td>'+escapeHtml(r.niche)+'</td><td>'+escapeHtml(r.kind)+'</td><td>'+
+      statusBadge(r.status === 'ok' ? 'done' : (r.status === 'error' ? 'failed' : r.status))+'</td><td>'+escapeHtml(r.message)+'</td></tr>').join('')+
+    '</tbody></table>';
 }
 
 async function runNiche(niche) {
