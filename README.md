@@ -64,7 +64,7 @@ Each niche can have its own configuration, voice, visual style, metadata rules, 
 The pipeline follows a clear production chain from content intake to upload. That makes the workflow easier to debug, improve, and delegate.
 
 ```text
-ingest → script/hook → narration → video assembly → metadata → thumbnail → upload → analytics
+ingest → script/hook → narration → video assembly → metadata → upload → thumbnail → analytics
 ```
 
 ### Built for Real Operations

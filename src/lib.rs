@@ -205,9 +205,11 @@ pub mod stages {
     pub const THUMBNAIL: &str = "thumbnail";
     pub const UPLOAD: &str = "upload";
 
-    /// The chain in execution order. `db.rs` and the ops CLI iterate this for
-    /// the status grid so adding a stage here surfaces it everywhere at once.
-    pub const ALL: &[&str] = &[INGEST, HOOK, TTS, ASSEMBLE, METADATA, THUMBNAIL, UPLOAD];
+    /// The chain in execution order — upload precedes thumbnail because
+    /// thumbnails.set needs the published video id. `db.rs` and the ops CLI
+    /// iterate this for the status grid so adding a stage here surfaces it
+    /// everywhere at once.
+    pub const ALL: &[&str] = &[INGEST, HOOK, TTS, ASSEMBLE, METADATA, UPLOAD, THUMBNAIL];
 }
 
 #[cfg(test)]

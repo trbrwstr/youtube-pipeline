@@ -64,8 +64,10 @@ impl Stage {
             Stage::Tts => Some(Stage::Hook),
             Stage::Assemble => Some(Stage::Tts),
             Stage::Metadata => Some(Stage::Assemble),
-            Stage::Thumbnail => Some(Stage::Metadata),
-            Stage::Upload => Some(Stage::Thumbnail),
+            // Upload needs only the rendered mp4 + metadata; thumbnail calls
+            // thumbnails.set on the PUBLISHED video, so it must follow upload.
+            Stage::Upload => Some(Stage::Metadata),
+            Stage::Thumbnail => Some(Stage::Upload),
         }
     }
     fn all() -> Vec<Stage> {
@@ -75,8 +77,8 @@ impl Stage {
             Stage::Tts,
             Stage::Assemble,
             Stage::Metadata,
-            Stage::Thumbnail,
             Stage::Upload,
+            Stage::Thumbnail,
         ]
     }
 }
@@ -1044,10 +1046,12 @@ async fn automation_tick(state: &Arc<AppState>) -> Result<()> {
     let now_ts = now.timestamp();
 
     // Daily selector pass runs ahead of production so today's cycles pick up
-    // fresh quotas. Stamped before the work so an erroring pass can't storm.
+    // fresh quotas. Awaited — not spawned — so a niche due on this same tick
+    // can't read yesterday's plan. Stamped before the work so an erroring
+    // pass can't storm. It's local SQLite only, so the wait is milliseconds.
     if automation::selector_due(&fleet, &today, now.hour() as i64) {
         automation::mark_selector_ran(&conn, &today)?;
-        spawn_selector_cycle(state, now_ts);
+        run_selector_pass(state, now_ts).await;
     }
 
     for path in discover_configs(&state.config_dir)? {
@@ -1149,9 +1153,11 @@ async fn run_automation_cycle(
     Ok(summary.join(" "))
 }
 
-fn spawn_selector_cycle(state: &Arc<AppState>, now_ts: i64) {
+/// Run the daily selector pass to completion. The caller awaits this so the
+/// production cycles scheduled later in the same tick read today's quotas.
+async fn run_selector_pass(state: &Arc<AppState>, now_ts: i64) {
     let state2 = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
+    let _ = tokio::task::spawn_blocking(move || {
         let run_id = automation::open(&state2.state_db)
             .and_then(|c| automation::record_run_start(&c, "fleet", "selector", now_ts));
         let (ok, msg) = match run_federated_selector(&state2.config_dir) {
@@ -1164,7 +1170,8 @@ fn spawn_selector_cycle(state: &Arc<AppState>, now_ts: i64) {
                     automation::record_run_finish(&c, id, ok, &msg, chrono::Utc::now().timestamp());
             }
         }
-    });
+    })
+    .await;
 }
 
 // ============================================================
@@ -1373,7 +1380,7 @@ input{background:var(--bg);border:1px solid var(--border);color:var(--text);padd
     <tbody id="autoRows"></tbody>
   </table>
   <div style="color:var(--muted);font-size:.85rem;margin-top:.5rem">
-    Enabled channels run the full chain (ingest &rarr; hook &rarr; tts &rarr; assemble &rarr; metadata &rarr; thumbnail &rarr; upload &rarr; analytics)
+    Enabled channels run the full chain (ingest &rarr; hook &rarr; tts &rarr; assemble &rarr; metadata &rarr; upload &rarr; thumbnail &rarr; analytics)
     on their own schedule, server-side. The selector re-allocates daily quotas across channels once a day.
   </div>
 </div>

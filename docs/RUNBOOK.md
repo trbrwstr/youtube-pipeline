@@ -137,8 +137,8 @@ Open `http://<server>:3000` and use the **Automation** panel:
 * **Per channel** — flip it on, set the cadence (`every N minutes`), the
   per-stage batch size, and whether the cycle should publish (`upload`) and
   snapshot performance (`analytics`). Each enabled channel then runs the full
-  chain (reap → ingest → hook → tts → assemble → metadata → thumbnail →
-  upload → analytics) on its own schedule, server-side.
+  chain (reap → ingest → hook → tts → assemble → metadata → upload →
+  thumbnail → analytics) on its own schedule, server-side.
 * **Daily selector** — once a day (at the UTC hour you pick) the federated
   selector re-scores every channel and reallocates tomorrow's production
   quotas, so the feedback loop closes without any manual step.
