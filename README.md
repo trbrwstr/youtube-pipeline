@@ -89,6 +89,188 @@ This is not a fragile one-off script. It uses a database-backed workflow, stage 
 
 ---
 
+## Project Structure
+
+```text
+youtube-pipeline/
+├── Cargo.toml              # Rust workspace: library + 6 binaries
+├── config/                 # Per-niche TOML configs
+│   ├── forgotten_classics.toml
+│   └── dead_authors.toml
+├── src/
+│   ├── lib.rs              # Shared pipeline library
+│   ├── bin/                # Standalone executables
+│   │   ├── pipeline.rs     # Single-niche stage runner + ops CLI
+│   │   ├── orchestrator.rs # Multi-niche fleet driver
+│   │   ├── dashboard.rs    # Web dashboard + scheduler
+│   │   ├── analytics.rs    # YouTube Analytics snapshot pull
+│   │   ├── selector.rs     # Cross-niche budget reallocation
+│   │   └── oauth_bootstrap.rs # YouTube OAuth refresh-token helper
+│   ├── config.rs           # AppConfig + TOML parsing
+│   ├── db.rs               # SQLite schema + migrations
+│   ├── state.rs            # Stage tracking, retries, dead letters
+│   ├── runner.rs           # Bounded-concurrency stage runner
+│   ├── ingest.rs           # Gutenberg / text ingestion
+│   ├── hook.rs             # Script / hook generation
+│   ├── tts.rs              # Text-to-speech audio
+│   ├── assemble.rs         # FFmpeg video assembly + captions
+│   ├── metadata.rs         # Title / description / tag generation
+│   ├── upload.rs           # YouTube Data API upload
+│   ├── thumbnail.rs        # Thumbnail upload after publish
+│   ├── analytics.rs        # Performance snapshot logic
+│   ├── selector.rs         # Explore/exploit quota allocation
+│   ├── automation.rs       # Scheduler + run history
+│   └── throttle.rs         # API rate limiting
+├── data/                   # SQLite databases + rendered videos
+├── cache/                  # Downloaded texts + cached audio
+└── docs/RUNBOOK.md         # Operator's guide
+```
+
+---
+
+## Quick Start
+
+### 1. Prerequisites
+
+- [Rust](https://rustup.rs/) (stable)
+- [FFmpeg](https://ffmpeg.org/download.html) installed and on `$PATH`
+- A YouTube OAuth client with the redirect URI `http://127.0.0.1:8080`
+- API keys for the services your config uses (OpenAI, TTS, etc.)
+
+### 2. Build
+
+```bash
+cargo build --release
+```
+
+All binaries are built into `target/release/`.
+
+### 3. Configure
+
+Copy one of the example configs and fill in your credentials:
+
+```bash
+cp config/forgotten_classics.toml config/my_channel.toml
+```
+
+At minimum you will need to export:
+
+```bash
+export OPENAI_API_KEY="sk-..."
+export YT_CLIENT_ID="..."
+export YT_CLIENT_SECRET="..."
+```
+
+### 4. Bootstrap YouTube OAuth
+
+```bash
+cargo run --bin oauth_bootstrap
+```
+
+Open the printed URL, grant access, then export the resulting refresh token in the matching `YT_REFRESH_TOKEN_*` variable for your niche.
+
+### 5. Run a dry pipeline
+
+Test ingestion and hook generation without uploading:
+
+```bash
+cargo run --bin pipeline -- run \
+  --config config/my_channel.toml \
+  --stages ingest,hook \
+  --limit 5
+```
+
+### 6. Run the full chain
+
+```bash
+cargo run --bin pipeline -- run \
+  --config config/my_channel.toml \
+  --limit 10
+```
+
+To run every configured niche under a shared concurrency cap:
+
+```bash
+cargo run --bin orchestrator -- --config-dir config --max-parallel 2
+```
+
+### 7. Start the dashboard
+
+```bash
+cargo run --bin dashboard -- --port 3000 --config-dir config
+```
+
+Open `http://localhost:3000` to view status, trigger runs, enable per-channel automation schedules, and inspect run history.
+
+---
+
+## CLI Reference
+
+### `pipeline`
+
+Single-niche stage runner and operational CLI.
+
+```bash
+pipeline run     --config config/forgotten_classics.toml --limit 50
+pipeline run     --config config/forgotten_classics.toml --stages hook,tts
+pipeline status  --config config/forgotten_classics.toml
+pipeline reap    --config config/forgotten_classics.toml --stale-secs 900
+pipeline retry   --config config/forgotten_classics.toml --stage upload
+pipeline dead    --config config/forgotten_classics.toml
+pipeline search  --config config/forgotten_classics.toml "frankenstein" --limit 20
+pipeline add     --config config/forgotten_classics.toml --ids 1342,98,84
+```
+
+### `orchestrator`
+
+Multi-niche driver that runs every `config/*.toml` in a sweep.
+
+```bash
+orchestrator --config-dir config --max-parallel 2
+orchestrator --niches forgotten_classics,dead_authors --loop --interval-secs 3600
+orchestrator --config-dir config --stages ingest,hook,tts --no-upload
+```
+
+### `dashboard`
+
+Web dashboard and scheduler.
+
+```bash
+dashboard --port 3000 --config-dir config --state-db data/dashboard.db
+```
+
+### `analytics`
+
+Pulls YouTube performance snapshots into the niche's `video_stats` table.
+
+```bash
+analytics --config config/forgotten_classics.toml
+analytics --config config/forgotten_classics.toml --until-days-ago 2
+```
+
+Run after you have published videos; the selector uses these numbers to reallocate quota.
+
+### `selector`
+
+Allocates the next production cycle's budget across niches.
+
+```bash
+selector --config config/forgotten_classics.toml
+selector --config-dir config
+```
+
+Use `--config-dir` for the federated cross-channel mode.
+
+### `oauth_bootstrap`
+
+Mint a long-lived refresh token for the YouTube upload / analytics stages.
+
+```bash
+oauth_bootstrap --client-id "$YT_CLIENT_ID" --client-secret "$YT_CLIENT_SECRET"
+```
+
+---
+
 ## Services I Can Provide
 
 I can help clients with work such as:
